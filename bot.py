@@ -35,30 +35,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     user_id = query.from_user.id
-    username = query.from_user.username or "Unknown"
+    data = query.data
 
     conn = sqlite3.connect('vpn_bot.db')
     cursor = conn.cursor()
 
-    # Проверить, есть ли пользователь в базе
-    cursor.execute('SELECT trial_used FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-
-    if result is None:
-        # Добавить нового пользователя
-        cursor.execute('INSERT INTO users (user_id, username, trial_used) VALUES (?, ?, 0)', (user_id, username))
-        conn.commit()
-        trial_used = 0
-    else:
-        trial_used = result[0]
-
-    data = query.data
-
-    if data is None:
-        return
-
     if data == "trial":
-        if trial_used == 1:
+        cursor.execute("SELECT trial_used FROM users WHERE user_id = ?", (user_id,))
+        result = cursor.fetchone()
+        if result and result[0] == 1:
             await query.edit_message_text("Вы уже использовали пробный период.")
         else:
             message = (
@@ -67,25 +52,76 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "⬇️Выберите устройство ниже:⬇️"
             )
             keyboard = [
-                [InlineKeyboardButton("Android", callback_data="device_android")],
-                [InlineKeyboardButton("iOS", callback_data="device_ios")],
-                [InlineKeyboardButton("Windows", callback_data="device_windows")],
-                [InlineKeyboardButton("Mac", callback_data="device_mac")]
+                [InlineKeyboardButton("iOs", callback_data="ios"), InlineKeyboardButton("Android", callback_data="android")],
+                [InlineKeyboardButton("MacOs", callback_data="macos"), InlineKeyboardButton("Windows", callback_data="windows")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(message, reply_markup=reply_markup)
-            # Отметить, что пробный период использован
-            cursor.execute('UPDATE users SET trial_used = 1 WHERE user_id = ?', (user_id,))
+            cursor.execute("INSERT OR REPLACE INTO users (user_id, trial_used) VALUES (?, 1)", (user_id,))
             conn.commit()
-    elif data.startswith("device_"):
-        device = data.split("_")[1]
-        key_message = f"Ключ для {device}: vless://c570a7a8-9d7e-4434-9269-45589b003857@144.31.120.167:443?type=tcp&encryption=none&security=reality&pbk=D_UlnUhHUnf6TRdDx39c5ew4v_x8rNPLSvD8-ATbEn4&fp=chrome&sni=google.com&sid=fce9aa3bd85c&spx=%2F#H20-lc3vdgu8"
-        await query.edit_message_text(key_message)
+    elif data == "ios":
+        message = (
+            "Скачать приложение:\n"
+            "Для пользователей с iOs 16 и выше : https://apps.apple.com/ru/app/v2raytun/id6476628951\n"
+            "Для пользователей с iOs до 16 : https://apps.apple.com/ru/app/v2box-v2ray-client/id6446814690\n"
+            "Для активации зайдите в приложение и скопировав ключ,нажмите добавить из буфера обмена"
+        )
+        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "android":
+        message = (
+            "Скачать приложение: https://play.google.com/store/apps/details?id=com.v2raytun.android&pcampaignid=web_share\n"
+            "Для активации зайдите в приложение и скопировав ключ,нажмите добавить из буфера обмена"
+        )
+        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "macos":
+        message = (
+            "Скачать приложение: https://apps.apple.com/us/app/v2raytun/id6476628951?platform=mac\n"
+            "Для активации зайдите в приложение и скопировав ключ,нажмите добавить из буфера обмена"
+        )
+        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "windows":
+        message = (
+            "Скачать приложение: https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Windows-Setup-x64.Msix\n"
+            "Для активации зайдите в приложение и скопировав ключ,нажмите добавить из буфера обмена"
+        )
+        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "back":
+        welcome_message = (
+            "Привет👋\n\n"
+            "Мы работаем и наша команда готова освободить Вас от:\n\n"
+            "Зависающих видео в запрещённой сети;\n"
+            "Бесконечного просмотра рекламы;\n"
+            "Блокировки из-за частой смены IP-адреса;\n"
+            "Утечки заряда батареи и ваших данных (как у бесплатных VPN)."
+        )
+        keyboard = [
+            [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(welcome_message, reply_markup=reply_markup)
 
     conn.close()
 
 def main() -> None:
     """Запуск бота."""
+    # Создание таблицы пользователей, если не существует
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        trial_used INTEGER DEFAULT 0
+    )''')
+    conn.commit()
+    conn.close()
+
     application = ApplicationBuilder().token(TOKEN).build()
 
     # Добавление обработчика команды /start
