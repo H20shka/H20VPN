@@ -1,5 +1,8 @@
 import logging
 import sqlite3
+import requests
+import time
+import uuid
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
@@ -9,6 +12,55 @@ logger = logging.getLogger(__name__)
 
 # Токен вашего бота (замените на реальный токен из @BotFather)
 TOKEN = '8272166182:AAGxnXg-rfFC0s5_fhSCrmISGC6eWDeSrws'
+
+# Настройки 3x-ui
+PANEL_URL = "http://144.31.120.167:54321"
+USERNAME = "H20shka"
+PASSWORD = "H20shka"
+INBOUND_ID = 1
+
+def generate_vpn_key(user_id, expiry_days=30, total_gb=100):
+    try:
+        # Login
+        login_url = f"{PANEL_URL}/api/user/login"
+        login_data = {"username": USERNAME, "password": PASSWORD}
+        response = requests.post(login_url, json=login_data)
+        if response.status_code != 200:
+            return None
+        session = response.json().get("obj", {}).get("session")
+        if not session:
+            return None
+        headers = {"Cookie": f"session={session}"}
+
+        # Add client
+        add_client_url = f"{PANEL_URL}/api/inbounds/addClient"
+        client_uuid = str(uuid.uuid4())
+        email = f"user_{user_id}_{int(time.time())}"
+        expiry_time = int(time.time() * 1000) + expiry_days * 24 * 60 * 60 * 1000
+        total_gb_bytes = total_gb * 1024 * 1024 * 1024
+        client_data = {
+            "id": INBOUND_ID,
+            "client": {
+                "id": client_uuid,
+                "email": email,
+                "limitIp": 0,
+                "totalGB": total_gb_bytes,
+                "expiryTime": expiry_time,
+                "enable": True,
+                "tgId": "",
+                "subId": ""
+            }
+        }
+        response = requests.post(add_client_url, json=client_data, headers=headers)
+        if response.status_code == 200:
+            # Generate link (hardcoded for now)
+            link = f"vless://{client_uuid}@144.31.120.167:443?type=tcp&encryption=none&security=reality&pbk=D_UlnUhHUnf6TRdDx39c5ew4v_x8rNPLSvD8-ATbEn4&fp=chrome&sni=google.com&sid=fce9aa3bd85c&spx=%2F#{email}"
+            return link
+        else:
+            return None
+    except Exception as e:
+        logger.error(f"Error generating key: {e}")
+        return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет приветственное сообщение при команде /start."""
@@ -23,7 +75,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Утечки заряда батареи и ваших данных (как у бесплатных VPN)."
     )
     keyboard = [
-        [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")]
+        [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")],
+        [InlineKeyboardButton("Помощь🆘", callback_data="help")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(welcome_message, reply_markup=reply_markup)
@@ -93,6 +146,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "help":
+        message = (
+            "Возникли вопросы❓❗️\n"
+            "Напиши нам и мы поможем со всем✅\n"
+            "Пиши: @H20tag"
+        )
+        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "back":
         welcome_message = (
             "Привет👋\n\n"
@@ -103,7 +165,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Утечки заряда батареи и ваших данных (как у бесплатных VPN)."
         )
         keyboard = [
-            [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")]
+            [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")],
+            [InlineKeyboardButton("Помощь🆘", callback_data="help")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(welcome_message, reply_markup=reply_markup)
@@ -117,7 +180,8 @@ def main() -> None:
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        trial_used INTEGER DEFAULT 0
+        trial_used INTEGER DEFAULT 0,
+        subscription_expiry INTEGER DEFAULT 0
     )''')
     conn.commit()
     conn.close()
