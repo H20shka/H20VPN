@@ -5,6 +5,7 @@ import requests
 import uuid
 import json
 import asyncio
+import random
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
@@ -17,24 +18,26 @@ TOKEN = '8272166182:AAGxnXg-rfFC0s5_fhSCrmISGC6eWDeSrws'
 
 def create_trial_inbound(user_id):
     try:
-        login_url = "http://144.31.120.167:54321/dvoykinsecretpanel/"
+        base_url = "http://144.31.120.167:54321/dvoykinsecretpanel"
+        login_url = f"{base_url}/login"
         login_data = {"username": "H20shka", "password": "aH0908bH?!"}
         session = requests.Session()
         response = session.post(login_url, data=login_data)
         if response.status_code != 200:
             return f"Ошибка входа в панель: {response.status_code} {response.text}"
-        
+
         client_id = str(uuid.uuid4())
-        
+        port = random.randint(10000, 65535)
+
         settings = {
             "clients": [
                 {
                     "id": client_id,
                     "flow": "",
-                    "email": f"user{user_id}@gmail.com",
+                    "email": f"user{user_id}_{int(time.time())}@gmail.com",
                     "limitIp": 0,
                     "totalGB": 1,
-                    "expiryTime": int(time.time() + 86400),
+                    "expiryTime": int(time.time() + 259200),
                     "enable": True,
                     "tgId": str(user_id),
                     "subId": ""
@@ -43,7 +46,7 @@ def create_trial_inbound(user_id):
             "decryption": "none",
             "fallbacks": []
         }
-        
+
         stream_settings = {
             "network": "tcp",
             "security": "reality",
@@ -59,7 +62,7 @@ def create_trial_inbound(user_id):
                 "shortIds": ["b1"],
                 "settings": {
                     "publicKey": "",
-                    "fingerprint": "random",
+                    "fingerprint": "chrome",
                     "serverName": "yahoo.com",
                     "spiderX": "/"
                 }
@@ -71,40 +74,63 @@ def create_trial_inbound(user_id):
                 }
             }
         }
-        
+
         sniffing = {
             "enabled": True,
             "destOverride": ["http", "tls", "quic"]
         }
-        
+
         inbound_data = {
             "up": 0,
             "down": 0,
             "total": 1073741824,
             "remark": f"Trial-{user_id}",
             "enable": True,
-            "expiryTime": int(time.time() + 86400),
+            "expiryTime": int(time.time() + 259200),
             "listen": "",
-            "port": 443,
+            "port": port,
             "protocol": "vless",
             "settings": json.dumps(settings),
             "streamSettings": json.dumps(stream_settings),
             "sniffing": json.dumps(sniffing)
         }
-        
-        create_url = "http://144.31.120.167:54321/dvoykinsecretpanel/panel/api/inbounds"
-        response = session.post(create_url, data=inbound_data)
-        
+
+        create_url = f"{base_url}/panel/api/inbounds/add"
+        response = session.post(create_url, json=inbound_data)
+
         if response.status_code == 200:
-            # update db
-            conn = sqlite3.connect('vpn_bot.db')
-            cursor = conn.cursor()
-            cursor.execute("UPDATE users SET trial_used = 1 WHERE user_id = ?", (user_id,))
-            conn.commit()
-            conn.close()
-            return f"Пробный период активирован!\n\nВаш Vless ключ: {client_id}\n\nПорт: 443\nТранспорт: TCP\nБезопасность: Reality\nСервер: 144.31.120.167"
+            try:
+                inbound_response = response.json()
+                if not isinstance(inbound_response, dict):
+                    return f"Ошибка: некорректный ответ от API: {inbound_response}"
+            except json.JSONDecodeError:
+                return f"Ошибка: ответ не является JSON: {response.text}"
+            if inbound_response.get('success') and inbound_response.get('obj'):
+                inbound_obj = inbound_response['obj']
+                if not inbound_obj or not isinstance(inbound_obj, dict):
+                    return "Ошибка: некорректная структура данных inbound в ответе"
+                stream_settings = inbound_obj.get('streamSettings', {})
+                if not isinstance(stream_settings, dict):
+                    return "Ошибка: некорректная структура streamSettings в ответе"
+                reality_settings = stream_settings.get('realitySettings', {})
+                if not isinstance(reality_settings, dict):
+                    return "Ошибка: некорректная структура realitySettings в ответе"
+                settings = reality_settings.get('settings', {})
+                if not isinstance(settings, dict):
+                    return "Ошибка: некорректная структура settings в ответе"
+                public_key = settings.get('publicKey', '')
+                if not public_key:
+                    return "Ошибка: publicKey не найден в ответе создания inbound"
+
+                # Генерация полного Vless URI
+                server = "144.31.120.167"
+                uri = f"vless://{client_id}@{server}:{port}?type=tcp&security=reality&pbk={public_key}&fp=chrome&sni=yahoo.com&sid=b1&spx=%2F#Trial-{user_id}"
+
+                return f"Пробный период активирован!\n\nВаш Vless ключ:\n{uri}\n\nСервер: {server}"
+            else:
+                return f"Ошибка создания инбаунда: {inbound_response}"
         else:
-            return f"Ошибка создания инбаунда: {response.text}"
+            return f"Ошибка создания инбаунда: {response.status_code} {response.text}"
     except Exception as e:
         return f"Ошибка: {str(e)}"
 
