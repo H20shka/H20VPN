@@ -6,6 +6,8 @@ import uuid
 import json
 import asyncio
 import random
+import base64
+from cryptography.hazmat.primitives.asymmetric import x25519
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
@@ -26,18 +28,80 @@ def create_trial_inbound(user_id):
         if response.status_code != 200:
             return f"Ошибка входа в панель: {response.status_code} {response.text}"
 
+        # Проверить существующие inbound для пользователя
+        list_url = f"{base_url}/panel/api/inbounds/list"
+        response = session.get(list_url)
+        if response.status_code == 200:
+            try:
+                inbounds_response = response.json()
+                if inbounds_response.get('success') and inbounds_response.get('obj'):
+                    for inbound in inbounds_response['obj']:
+                        if inbound.get('remark') == "H2O":
+                            if inbound.get('enable') and inbound.get('expiryTime', 0) > time.time() * 1000:
+                                # Найден активный inbound, извлечь ключ
+                                settings_str = inbound.get('settings')
+                                if settings_str:
+                                    try:
+                                        settings = json.loads(settings_str)
+                                        clients = settings.get('clients', [])
+                                        if clients:
+                                            client_id = clients[0].get('id')
+                                            port = inbound.get('port')
+                                            stream_settings_str = inbound.get('streamSettings')
+                                            if stream_settings_str:
+                                                stream_settings = json.loads(stream_settings_str)
+                                                reality_settings = stream_settings.get('realitySettings', {})
+                                                inner_settings = reality_settings.get('settings', {})
+                                                public_key = inner_settings.get('publicKey')
+                                                if client_id and port and public_key:
+                                                    server = "144.31.120.167"
+                                                uri = f"vless://{client_id}@{server}:{port}?type=tcp&encryption=none&security=reality&pbk={public_key}&fp=chrome&sni=google.com&sid={stream_settings['realitySettings']['shortIds'][0]}&spx=%2F#H2O"
+                                                return uri
+                                    except json.JSONDecodeError:
+                                        pass
+                            else:
+                                # Найден истекший inbound, извлечь ключ и вернуть сообщение активации
+                                settings_str = inbound.get('settings')
+                                if settings_str:
+                                    try:
+                                        settings = json.loads(settings_str)
+                                        clients = settings.get('clients', [])
+                                        if clients:
+                                            client_id = clients[0].get('id')
+                                            port = inbound.get('port')
+                                            stream_settings_str = inbound.get('streamSettings')
+                                            if stream_settings_str:
+                                                stream_settings = json.loads(stream_settings_str)
+                                                reality_settings = stream_settings.get('realitySettings', {})
+                                                inner_settings = reality_settings.get('settings', {})
+                                                public_key = inner_settings.get('publicKey')
+                                                if client_id and port and public_key:
+                                                    server = "144.31.120.167"
+                                                    uri = f"vless://{client_id}@{server}:{port}?type=tcp&encryption=none&security=reality&pbk={public_key}&fp=chrome&sni=google.com&sid={stream_settings['realitySettings']['shortIds'][0]}&spx=%2F#H2O"
+                                                    return uri
+                                    except json.JSONDecodeError:
+                                        pass
+            except json.JSONDecodeError:
+                pass
+
+        # Если не найден активный, создать новый
         client_id = str(uuid.uuid4())
-        port = random.randint(10000, 65535)
+        port = random.randint(10000, 25000)
+
+        # Генерация ключей X25519 для Reality
+        private_key = x25519.X25519PrivateKey.generate()
+        public_key_b64 = base64.urlsafe_b64encode(private_key.public_key().public_bytes_raw()).decode().rstrip('=')
+        private_key_b64 = base64.urlsafe_b64encode(private_key.private_bytes_raw()).decode().rstrip('=')
 
         settings = {
             "clients": [
                 {
                     "id": client_id,
-                    "flow": "",
+                    "flow": "xtls-rprx-vision",
                     "email": f"user{user_id}_{int(time.time())}@gmail.com",
                     "limitIp": 0,
-                    "totalGB": 1,
-                    "expiryTime": int(time.time() + 259200),
+                    "totalGB": 0,
+                    "expiryTime": int((time.time() + 259200) * 1000),
                     "enable": True,
                     "tgId": str(user_id),
                     "subId": ""
@@ -53,17 +117,17 @@ def create_trial_inbound(user_id):
             "realitySettings": {
                 "show": False,
                 "xver": 0,
-                "dest": "yahoo.com:443",
-                "serverNames": ["yahoo.com"],
-                "privateKey": "",
-                "minClient": "",
-                "maxClient": "",
+                "dest": "google.com:443",
+                "serverNames": ["google.com", "www.google.com"],
+                "privateKey": private_key_b64,
+                "minClient": "25.9.11",
+                "maxClient": "25.9.11",
                 "maxTimediff": 0,
-                "shortIds": ["b1"],
+                "shortIds": [f"{random.randint(0, 0xFFFFFFFF):08x}"],
                 "settings": {
-                    "publicKey": "",
+                    "publicKey": public_key_b64,
                     "fingerprint": "chrome",
-                    "serverName": "yahoo.com",
+                    "serverName": "google.com",
                     "spiderX": "/"
                 }
             },
@@ -83,10 +147,10 @@ def create_trial_inbound(user_id):
         inbound_data = {
             "up": 0,
             "down": 0,
-            "total": 1073741824,
-            "remark": f"Trial-{user_id}",
+            "total": 0,
+            "remark": "H2O",
             "enable": True,
-            "expiryTime": int(time.time() + 259200),
+            "expiryTime": int((time.time() + 259200) * 1000),
             "listen": "",
             "port": port,
             "protocol": "vless",
@@ -106,27 +170,11 @@ def create_trial_inbound(user_id):
             except json.JSONDecodeError:
                 return f"Ошибка: ответ не является JSON: {response.text}"
             if inbound_response.get('success') and inbound_response.get('obj'):
-                inbound_obj = inbound_response['obj']
-                if not inbound_obj or not isinstance(inbound_obj, dict):
-                    return "Ошибка: некорректная структура данных inbound в ответе"
-                stream_settings = inbound_obj.get('streamSettings', {})
-                if not isinstance(stream_settings, dict):
-                    return "Ошибка: некорректная структура streamSettings в ответе"
-                reality_settings = stream_settings.get('realitySettings', {})
-                if not isinstance(reality_settings, dict):
-                    return "Ошибка: некорректная структура realitySettings в ответе"
-                settings = reality_settings.get('settings', {})
-                if not isinstance(settings, dict):
-                    return "Ошибка: некорректная структура settings в ответе"
-                public_key = settings.get('publicKey', '')
-                if not public_key:
-                    return "Ошибка: publicKey не найден в ответе создания inbound"
-
-                # Генерация полного Vless URI
+                # Генерация полного Vless URI с заранее сгенерированными ключами
                 server = "144.31.120.167"
-                uri = f"vless://{client_id}@{server}:{port}?type=tcp&security=reality&pbk={public_key}&fp=chrome&sni=yahoo.com&sid=b1&spx=%2F#Trial-{user_id}"
+                uri = f"vless://{client_id}@{server}:{port}?type=tcp&encryption=none&security=reality&pbk={public_key_b64}&fp=chrome&sni=google.com&sid={stream_settings['realitySettings']['shortIds'][0]}&spx=%2F#H2O"
 
-                return f"Пробный период активирован!\n\nВаш Vless ключ:\n{uri}\n\nСервер: {server}"
+                return uri
             else:
                 return f"Ошибка создания инбаунда: {inbound_response}"
         else:
@@ -172,7 +220,50 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Создать инбаунд
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, create_trial_inbound, user_id)
-        await query.edit_message_text(result)
+        if result.startswith("vless://"):
+            message = f"Ключ выдается едино-разово на 3 дня.\nКлюч: {result}\n⬇️Выберите устройство ниже:⬇️"
+            keyboard = [
+                [InlineKeyboardButton("iOs", callback_data="ios"), InlineKeyboardButton("Android", callback_data="android")],
+                [InlineKeyboardButton("MacOs", callback_data="macos"), InlineKeyboardButton("Windows", callback_data="windows")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(message, reply_markup=reply_markup)
+        else:
+            await query.edit_message_text(result)
+    elif data == "ios":
+        message = (
+            "Скачать приложение:\n"
+            "Для пользователей с iOs 16 и выше: https://apps.apple.com/ru/app/v2raytun/id6476628951\n"
+            "Для пользователей с iOs до 16: https://apps.apple.com/ru/app/v2box-v2ray-client/id6446814690\n"
+            "Для активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
+        )
+        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "android":
+        message = (
+            "Скачать приложение: https://play.google.com/store/apps/details?id=com.v2raytun.android&pcampaignid=web_share\n"
+            "Для активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
+        )
+        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "macos":
+        message = (
+            "Скачать приложение: https://apps.apple.com/us/app/v2raytun/id6476628951?platform=mac\n"
+            "Для активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
+        )
+        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "windows":
+        message = (
+            "Скачать приложение: https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Windows-Setup-x64.Msix\n"
+            "Для активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
+        )
+        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "help":
         message = (
             "Возникли вопросы❓❗️\n"
