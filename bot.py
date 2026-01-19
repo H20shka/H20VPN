@@ -196,6 +196,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     keyboard = [
         [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")],
+        [InlineKeyboardButton("О сервисе📊", callback_data="about")],
         [InlineKeyboardButton("Помощь🆘", callback_data="help")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -221,7 +222,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, create_trial_inbound, user_id)
         if result.startswith("vless://"):
-            message = f"Ключ выдается едино-разово на 3 дня.\nКлюч: {result}\n⬇️Выберите устройство ниже:⬇️"
+            message = f"Ключ выдается едино-разово на 3 дня.\nКлюч: `{result}`\n⬇️Выберите устройство ниже:⬇️"
             keyboard = [
                 [InlineKeyboardButton("iOs", callback_data="ios"), InlineKeyboardButton("Android", callback_data="android")],
                 [InlineKeyboardButton("MacOs", callback_data="macos"), InlineKeyboardButton("Windows", callback_data="windows")]
@@ -273,6 +274,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "about":
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        active_users = cursor.fetchone()[0]
+        conn.close()
+        message = (
+            "Мы предоставляем VPN с самой высокой скоростью и комфортной настройкой за считанные секунды.\n\n"
+            f"Количество активных пользователей-{active_users}🧮;\n"
+            "Сколько мы уже работаем-мы работаем для вас каждый день с 02.11.2025🗓;\n"
+            "Активная поддержка 24/7📩;\n"
+            "Высокая скорость и доступность нескольких локаций🏎;"
+        )
+        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "back":
         welcome_message = (
             "Привет👋\n\n"
@@ -284,6 +301,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         keyboard = [
             [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")],
+            [InlineKeyboardButton("О сервисе📊", callback_data="about")],
             [InlineKeyboardButton("Помощь🆘", callback_data="help")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
