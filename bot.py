@@ -36,7 +36,7 @@ def create_trial_inbound(user_id):
                 inbounds_response = response.json()
                 if inbounds_response.get('success') and inbounds_response.get('obj'):
                     for inbound in inbounds_response['obj']:
-                        if inbound.get('remark') == "H2O":
+                        if inbound.get('remark') == f"H2O_{user_id}":
                             if inbound.get('enable') and inbound.get('expiryTime', 0) > time.time() * 1000:
                                 # Найден активный inbound, извлечь ключ
                                 settings_str = inbound.get('settings')
@@ -148,7 +148,7 @@ def create_trial_inbound(user_id):
             "up": 0,
             "down": 0,
             "total": 0,
-            "remark": "H2O",
+            "remark": f"H2O_{user_id}",
             "enable": True,
             "expiryTime": int((time.time() + 259200) * 1000),
             "listen": "",
@@ -224,6 +224,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if result.startswith("vless://"):
             message = f"Ключ выдается едино-разово на 3 дня.\nКлюч: `{result}`\n⬇️Выберите устройство ниже:⬇️"
             keyboard = [
+                [InlineKeyboardButton("Скопировать ключ", copy_text=result)],
                 [InlineKeyboardButton("iOs", callback_data="ios"), InlineKeyboardButton("Android", callback_data="android")],
                 [InlineKeyboardButton("MacOs", callback_data="macos"), InlineKeyboardButton("Windows", callback_data="windows")]
             ]
