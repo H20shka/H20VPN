@@ -206,7 +206,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
         if member.status not in ['member', 'administrator', 'creator']:
-            keyboard = [[InlineKeyboardButton("Подписаться✅", url="https://t.me/H20_shop1")]]
+            keyboard = [
+                [InlineKeyboardButton("Подписаться✅", url="https://t.me/H20_shop1")],
+                [InlineKeyboardButton("Проверить подписку", callback_data="check_sub")]
+            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text("Для использования бота подпишитесь на наш канал.", reply_markup=reply_markup)
             return
@@ -242,7 +245,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, create_trial_inbound, user_id)
         if result.startswith("vless://"):
-            message = "🟢Ключ выдается едино-разово на 3 дня🟢\n🔴Ключ вы можете скопировать ниже,по нажатию на кнопку🔴\n⬇️Выберите устройство ниже:⬇️"
+            message = "🟢Ключ выдается едино-разово на 3 дня🟢\n🔴Ключ🔴\n⬇️Выберите устройство ниже:⬇️"
             keyboard = [
                 [InlineKeyboardButton("Скопировать ключ", copy_text={"text": result})],
                 [InlineKeyboardButton("iOs📱", callback_data="ios"), InlineKeyboardButton("Android📱", callback_data="android")],
@@ -319,6 +322,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "check_sub":
+        # Проверить подписку
+        try:
+            member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                keyboard = [
+                    [InlineKeyboardButton("Подписаться✅", url="https://t.me/H20_shop1")],
+                    [InlineKeyboardButton("Проверить подписку", callback_data="check_sub")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text("Вы не подписаны на канал. Для использования бота подпишитесь на наш канал.", reply_markup=reply_markup)
+            else:
+                keyboard = [
+                    [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")],
+                    [InlineKeyboardButton("О сервисе📊", callback_data="about")],
+                    [InlineKeyboardButton("Помощь🆘", callback_data="help")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text("Подписка проверена! Выберите опцию:", reply_markup=reply_markup)
+        except BadRequest:
+            await query.edit_message_text("Не удалось проверить подписку на канал.")
     elif data == "back":
         welcome_message = (
             "Привет👋\n\n"
