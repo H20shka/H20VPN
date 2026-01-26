@@ -194,11 +194,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Привет👋")
 
     info_message = (
-        "Мы работаем и наша команда готова освободить Вас от:\n\n"
-        "Зависающих видео в запрещённой сети;\n"
-        "Бесконечного просмотра рекламы;\n"
-        "Блокировки из-за частой смены IP-адреса;\n"
-        "Утечки заряда батареи и ваших данных (как у бесплатных VPN)."
+        "🔋Мы работаем и наша команда готова освободить Вас от:\n\n"
+        "⌛️Зависающих видео в запрещённой сети;\n"
+        "📲Бесконечного просмотра рекламы;\n"
+        "❌Блокировки из-за частой смены IP-адреса;\n"
+        "🪫Утечки заряда батареи и ваших данных (как у бесплатных VPN)."
     )
     await update.message.reply_text(info_message)
 
@@ -223,7 +223,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("Помощь🆘", callback_data="help")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выберите опцию:", reply_markup=reply_markup)
+    await update.message.reply_text("⬇️Выберите опцию из доступных ниже:⬇️", reply_markup=reply_markup)
     # Добавить пользователя в базу
     conn = sqlite3.connect('vpn_bot.db')
     cursor = conn.cursor()
@@ -245,19 +245,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, create_trial_inbound, user_id)
         if result.startswith("vless://"):
-            message = "🟢Ключ выдается едино-разово на 3 дня🟢\n🔴Ключ🔴\n⬇️Выберите устройство ниже:⬇️"
+            message = f"🟢Ключ выдается едино-разово на 3 дня🟢\n🔴Ключ: {result}\n⬇️Выберите устройство ниже:⬇️"
             keyboard = [
                 [InlineKeyboardButton("Скопировать ключ", copy_text={"text": result})],
                 [InlineKeyboardButton("iOs📱", callback_data="ios"), InlineKeyboardButton("Android📱", callback_data="android")],
                 [InlineKeyboardButton("MacOs💻", callback_data="macos"), InlineKeyboardButton("Windows🖥", callback_data="windows")],
-                [InlineKeyboardButton("Linux💻", callback_data="linux")]
+                [InlineKeyboardButton("Linux💻", callback_data="linux")],
+                [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(message, reply_markup=reply_markup)
         else:
             await query.edit_message_text(result)
     elif data == "ios":
-        message = "Скачать приложение выбрав снизу и нажав на кнопку⬇️\nДля активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена."
+        message = "Скачать приложение можно выбрав снизу подходящию версию iOs и нажав на нужную кнопку⬇️\nДля активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена."
         keyboard = [
             [InlineKeyboardButton("Для пользователей с iOs 16 и выше🟡", url="https://apps.apple.com/ru/app/v2raytun/id6476628951")],
             [InlineKeyboardButton("Для пользователей с iOs до 16🟢", url="https://apps.apple.com/ru/app/v2box-v2ray-client/id6446814690")],
