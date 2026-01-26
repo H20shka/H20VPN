@@ -10,6 +10,7 @@ import base64
 from cryptography.hazmat.primitives.asymmetric import x25519
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.error import BadRequest
 
 # Включить логирование
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -18,6 +19,9 @@ logger = logging.getLogger(__name__)
 # Токен вашего бота (замените на реальный токен из @BotFather)
 TOKEN = '8272166182:AAGxnXg-rfFC0s5_fhSCrmISGC6eWDeSrws'
 
+# ID канала для проверки подписки
+CHANNEL_ID = '@H20_shop1'
+
 def create_trial_inbound(user_id):
     try:
         base_url = "http://144.31.120.167:54321/dvoykinsecretpanel"
@@ -25,8 +29,6 @@ def create_trial_inbound(user_id):
         login_data = {"username": "H20shka", "password": "aH0908bH?!"}
         session = requests.Session()
         response = session.post(login_url, data=login_data)
-        if response.status_code != 200:
-            return f"Ошибка входа в панель: {response.status_code} {response.text}"
 
         # Проверить существующие inbound для пользователя
         list_url = f"{base_url}/panel/api/inbounds/list"
@@ -186,6 +188,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет приветственное сообщение при команде /start."""
     if update.message is None:
         return
+
+    user_id = update.message.from_user.id
+
+    # Проверить подписку на канал
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        if member.status not in ['member', 'administrator', 'creator']:
+            await update.message.reply_text(f"Для использования бота подпишитесь на наш канал: {CHANNEL_ID}")
+            return
+    except BadRequest:
+        await update.message.reply_text("Не удалось проверить подписку на канал.")
+        return
+
     welcome_message = (
         "Привет👋\n\n"
         "Мы работаем и наша команда готова освободить Вас от:\n\n"
