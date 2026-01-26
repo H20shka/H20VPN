@@ -191,31 +191,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     user_id = update.message.from_user.id
 
-    # Проверить подписку на канал
-    try:
-        member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        if member.status not in ['member', 'administrator', 'creator']:
-            await update.message.reply_text(f"Для использования бота подпишитесь на наш канал: {CHANNEL_ID}")
-            return
-    except BadRequest:
-        await update.message.reply_text("Не удалось проверить подписку на канал.")
-        return
+    await update.message.reply_text("Привет👋")
 
-    welcome_message = (
-        "Привет👋\n\n"
+    info_message = (
         "Мы работаем и наша команда готова освободить Вас от:\n\n"
         "Зависающих видео в запрещённой сети;\n"
         "Бесконечного просмотра рекламы;\n"
         "Блокировки из-за частой смены IP-адреса;\n"
         "Утечки заряда батареи и ваших данных (как у бесплатных VPN)."
     )
+    await update.message.reply_text(info_message)
+
+    # Проверить подписку на канал
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        if member.status not in ['member', 'administrator', 'creator']:
+            keyboard = [[InlineKeyboardButton("Подписаться✅", url="https://t.me/H20_shop1")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text("Для использования бота подпишитесь на наш канал.", reply_markup=reply_markup)
+            return
+    except BadRequest:
+        await update.message.reply_text("Не удалось проверить подписку на канал.")
+        return
+
     keyboard = [
         [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")],
         [InlineKeyboardButton("О сервисе📊", callback_data="about")],
         [InlineKeyboardButton("Помощь🆘", callback_data="help")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(welcome_message, reply_markup=reply_markup)
+    await update.message.reply_text("Выберите опцию:", reply_markup=reply_markup)
     # Добавить пользователя в базу
     conn = sqlite3.connect('vpn_bot.db')
     cursor = conn.cursor()
@@ -237,48 +242,56 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, create_trial_inbound, user_id)
         if result.startswith("vless://"):
-            message = f"Ключ выдается едино-разово на 3 дня.\nКлюч: `{result}`\n⬇️Выберите устройство ниже:⬇️"
+            message = "🟢Ключ выдается едино-разово на 3 дня🟢\n🔴Ключ вы можете скопировать ниже,по нажатию на кнопку🔴\n⬇️Выберите устройство ниже:⬇️"
             keyboard = [
-                [InlineKeyboardButton("Скопировать ключ", copy_text=result)],
-                [InlineKeyboardButton("iOs", callback_data="ios"), InlineKeyboardButton("Android", callback_data="android")],
-                [InlineKeyboardButton("MacOs", callback_data="macos"), InlineKeyboardButton("Windows", callback_data="windows")]
+                [InlineKeyboardButton("Скопировать ключ", copy_text={"text": result})],
+                [InlineKeyboardButton("iOs📱", callback_data="ios"), InlineKeyboardButton("Android📱", callback_data="android")],
+                [InlineKeyboardButton("MacOs💻", callback_data="macos"), InlineKeyboardButton("Windows🖥", callback_data="windows")],
+                [InlineKeyboardButton("Linux💻", callback_data="linux")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(message, reply_markup=reply_markup)
         else:
             await query.edit_message_text(result)
     elif data == "ios":
-        message = (
-            "Скачать приложение:\n"
-            "Для пользователей с iOs 16 и выше: https://apps.apple.com/ru/app/v2raytun/id6476628951\n"
-            "Для пользователей с iOs до 16: https://apps.apple.com/ru/app/v2box-v2ray-client/id6446814690\n"
-            "Для активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
-        )
-        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        message = "Скачать приложение выбрав снизу и нажав на кнопку⬇️\nДля активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена."
+        keyboard = [
+            [InlineKeyboardButton("Для пользователей с iOs 16 и выше🟡", url="https://apps.apple.com/ru/app/v2raytun/id6476628951")],
+            [InlineKeyboardButton("Для пользователей с iOs до 16🟢", url="https://apps.apple.com/ru/app/v2box-v2ray-client/id6446814690")],
+            [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "android":
-        message = (
-            "Скачать приложение: https://play.google.com/store/apps/details?id=com.v2raytun.android&pcampaignid=web_share\n"
-            "Для активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
-        )
-        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        message = "Скачать приложение можно ниже по нажатию на кнопку⬇️\nДля активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
+        keyboard = [
+            [InlineKeyboardButton("Скачать для Android🟠", url="https://play.google.com/store/apps/details?id=com.v2raytun.android&pcampaignid=web_share")],
+            [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "macos":
-        message = (
-            "Скачать приложение: https://apps.apple.com/us/app/v2raytun/id6476628951?platform=mac\n"
-            "Для активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
-        )
-        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        message = "Скачать приложение можно ниже по нажатию на кнопку⬇️\nДля активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
+        keyboard = [
+            [InlineKeyboardButton("Скачать для MacOs💻", url="https://apps.apple.com/us/app/v2raytun/id6476628951?platform=mac")],
+            [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "windows":
-        message = (
-            "Скачать приложение: https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Windows-Setup-x64.Msix\n"
-            "Для активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
-        )
-        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        message = "Скачать приложение можно ниже по нажатию на кнопку⬇️\nДля активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
+        keyboard = [
+            [InlineKeyboardButton("Скачать для Windows🖥", url="https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Windows-Setup-x64.Msix")],
+            [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "linux":
+        message = "Скачать приложение можно ниже по нажатию на кнопку⬇️\nДля активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена"
+        keyboard = [
+            [InlineKeyboardButton("Скачать для Linux💻", url="https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Linux-x64.AppImage")],
+            [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "help":
