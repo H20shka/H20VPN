@@ -1,3 +1,4 @@
 requests
 cryptography
 python-telegram-bot
+nest_asyncio
