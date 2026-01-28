@@ -7,10 +7,13 @@ import json
 import asyncio
 import random
 import base64
+import nest_asyncio
 from cryptography.hazmat.primitives.asymmetric import x25519
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.error import BadRequest
+
+nest_asyncio.apply()
 
 # Включить логирование
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -21,6 +24,9 @@ TOKEN = '8272166182:AAGxnXg-rfFC0s5_fhSCrmISGC6eWDeSrws'
 
 # ID канала для проверки подписки
 CHANNEL_ID = '@H20_shop1'
+
+# Список админов (добавьте свои user_id)
+ADMINS = [863968972, 551107612]
 
 def create_trial_inbound(user_id):
     try:
@@ -191,6 +197,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     user_id = update.message.from_user.id
 
+    # Проверить блокировку
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT banned FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row and row[0] == 1:
+        await update.message.reply_text("Вы заблокированы.")
+        return
+
     await update.message.reply_text("Привет👋")
 
     info_message = (
@@ -222,6 +238,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("О сервисе📊", callback_data="about")],
         [InlineKeyboardButton("Помощь🆘", callback_data="help")]
     ]
+    if user_id in ADMINS:
+        keyboard.insert(0, [InlineKeyboardButton("Админка", callback_data="admin")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("⬇️Выберите опцию из доступных ниже:⬇️", reply_markup=reply_markup)
     # Добавить пользователя в базу
@@ -241,10 +259,61 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data
 
     if data == "trial":
+        # Проверить статус пробного периода
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT trial_used, subscription_expiry FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        current_time = time.time()
+        if row:
+            trial_used, subscription_expiry = row
+            if trial_used == 0:
+                # Не активирован, предложить активировать
+                keyboard = [
+                    [InlineKeyboardButton("Активировать пробный период⌚️", callback_data="activate_trial")],
+                    [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text("Пробный период не активирован. Хотите активировать?", reply_markup=reply_markup)
+            elif subscription_expiry > current_time:
+                # Активен, показать оставшееся время
+                remaining = int(subscription_expiry - current_time)
+                days = remaining // 86400
+                hours = (remaining % 86400) // 3600
+                minutes = (remaining % 3600) // 60
+                message = f"Пробный период активен. Осталось времени: {days} дней {hours} часов {minutes} минут."
+                keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(message, reply_markup=reply_markup)
+            else:
+                # Истек
+                message = "Ваш пробный период закончился."
+                keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(message, reply_markup=reply_markup)
+        else:
+            # Пользователь не найден, но это маловероятно
+            await query.edit_message_text("Ошибка: пользователь не найден.")
+    elif data == "activate_trial":
+        # Активировать пробный период
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT trial_used FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row and row[0] == 1:
+            await query.edit_message_text("Вы уже использовали пробный период.")
+            conn.close()
+            return
         # Создать инбаунд
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, create_trial_inbound, user_id)
         if result.startswith("vless://"):
+            # Обновить базу данных
+            expiry_time = int(time.time() + 259200)
+            cursor.execute("UPDATE users SET trial_used = 1, subscription_expiry = ?, trial_notification_sent = 0 WHERE user_id = ?", (expiry_time, user_id))
+            conn.commit()
+            conn.close()
             message = f"🟢Ключ выдается едино-разово на 3 дня🟢\n🔴Ключ: {result}\n⬇️Выберите устройство ниже:⬇️"
             keyboard = [
                 [InlineKeyboardButton("Скопировать ключ", copy_text={"text": result})],
@@ -256,6 +325,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(message, reply_markup=reply_markup)
         else:
+            conn.close()
             await query.edit_message_text(result)
     elif data == "ios":
         message = "Скачать приложение можно выбрав снизу подходящию версию iOs и нажав на нужную кнопку⬇️\nДля активации зайдите в приложение и скопировав ключ, нажмите добавить из буфера обмена."
@@ -358,10 +428,133 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             [InlineKeyboardButton("О сервисе📊", callback_data="about")],
             [InlineKeyboardButton("Помощь🆘", callback_data="help")]
         ]
+        if user_id in ADMINS:
+            keyboard.insert(0, [InlineKeyboardButton("Админка", callback_data="admin")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(welcome_message, reply_markup=reply_markup)
+    elif data == "admin":
+        if user_id not in ADMINS:
+            return
+        keyboard = [
+            [InlineKeyboardButton("Просмотр пользователей", callback_data="admin_users")],
+            [InlineKeyboardButton("Заблокировать пользователя", callback_data="admin_ban")],
+            [InlineKeyboardButton("Анулировать подписку", callback_data="admin_cancel")],
+            [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("Админ меню:", reply_markup=reply_markup)
+    elif data == "admin_users":
+        if user_id not in ADMINS:
+            return
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, trial_used, subscription_expiry, banned FROM users")
+        rows = cursor.fetchall()
+        conn.close()
+        message = "Пользователи:\n"
+        for row in rows:
+            status = "Заблокирован" if row[3] else ("Активен" if row[2] > time.time() else "Неактивен")
+            message += f"ID: {row[0]}, Trial: {'Да' if row[1] else 'Нет'}, Status: {status}\n"
+        await query.edit_message_text(message[:4000], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
+    elif data == "admin_ban":
+        if user_id not in ADMINS:
+            return
+        await query.edit_message_text("Введите команду /ban <user_id> для блокировки.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
+    elif data == "admin_cancel":
+        if user_id not in ADMINS:
+            return
+        await query.edit_message_text("Введите команду /cancel <user_id> для анулирования подписки.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
 
-def main() -> None:
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /ban <user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Неверный user_id")
+        return
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET banned = 1 WHERE user_id = ?", (target_id,))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"Пользователь {target_id} заблокирован.")
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /unban <user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Неверный user_id")
+        return
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET banned = 0 WHERE user_id = ?", (target_id,))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"Пользователь {target_id} разблокирован.")
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /cancel <user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Неверный user_id")
+        return
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET subscription_expiry = 0 WHERE user_id = ?", (target_id,))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"Подписка пользователя {target_id} анулирована.")
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, trial_used, subscription_expiry, banned FROM users")
+    rows = cursor.fetchall()
+    conn.close()
+    message = "Пользователи:\n"
+    for row in rows:
+        status = "Заблокирован" if row[3] else ("Активен" if row[2] > time.time() else "Неактивен")
+        message += f"ID: {row[0]}, Trial: {'Да' if row[1] else 'Нет'}, Status: {status}\n"
+    await update.message.reply_text(message[:4000])
+
+async def check_trial_expiry(application):
+    """Проверяет истекшие пробные периоды и отправляет уведомления."""
+    while True:
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users WHERE subscription_expiry > 0 AND subscription_expiry < ? AND trial_notification_sent = 0", (time.time(),))
+        expired_users = cursor.fetchall()
+        for (user_id,) in expired_users:
+            try:
+                await application.bot.send_message(chat_id=user_id, text="Ваш пробный период закончился. Для продолжения приобретите подписку.")
+                cursor.execute("UPDATE users SET trial_notification_sent = 1 WHERE user_id = ?", (user_id,))
+            except Exception as e:
+                logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
+        conn.commit()
+        conn.close()
+        await asyncio.sleep(3600)  # Проверка каждый час
+
+async def main() -> None:
     """Запуск бота."""
     # Создание таблицы пользователей, если не существует
     conn = sqlite3.connect('vpn_bot.db')
@@ -369,13 +562,19 @@ def main() -> None:
     cursor.execute('''CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         trial_used INTEGER DEFAULT 0,
-        subscription_expiry INTEGER DEFAULT 0
+        subscription_expiry INTEGER DEFAULT 0,
+        trial_notification_sent INTEGER DEFAULT 0,
+        banned INTEGER DEFAULT 0
     )''')
-    # Add column if not exists
+    # Add columns if not exists
     try:
-        cursor.execute("ALTER TABLE users ADD COLUMN subscription_expiry INTEGER DEFAULT 0")
+        cursor.execute("ALTER TABLE users ADD COLUMN trial_notification_sent INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
-        pass  # Column already exists
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -387,8 +586,17 @@ def main() -> None:
     # Добавление обработчика callback запросов
     application.add_handler(CallbackQueryHandler(handle_callback))
 
+    # Добавление админ команд
+    application.add_handler(CommandHandler("ban", ban_command))
+    application.add_handler(CommandHandler("unban", unban_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("users", users_command))
+
+    # Запустить фоновую задачу для проверки истекших пробных периодов
+    asyncio.create_task(check_trial_expiry(application))
+
     # Запуск бота
-    application.run_polling()
+    await application.run_polling()
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
