@@ -22,19 +22,21 @@ nest_asyncio.apply()
 # Flask app for webhook
 app = Flask(__name__)
 
-@app.route('/xrocket_webhook', methods=['POST'])
-def xrocket_webhook():
+@app.route('/crypto_webhook', methods=['POST'])
+def crypto_webhook():
     data = request.get_json()
-    logger.info(f"Webhook received: {data}")
-    payment_id = data.get('payment_id')
-    status = data.get('status')
-    if status == 'paid':
-        conn = sqlite3.connect('vpn_bot.db')
-        cursor = conn.cursor()
-        cursor.execute("UPDATE payments SET status = 'paid' WHERE payment_id = ?", (payment_id,))
-        conn.commit()
-        conn.close()
-        logger.info(f"Payment {payment_id} marked as paid")
+    logger.info(f"Crypto Pay webhook received: {data}")
+    update_type = data.get('update_type')
+    if update_type == 'invoice_paid':
+        invoice = data.get('payload', {}).get('invoice', {})
+        invoice_id = invoice.get('invoice_id')
+        if invoice_id:
+            conn = sqlite3.connect('vpn_bot.db')
+            cursor = conn.cursor()
+            cursor.execute("UPDATE payments SET status = 'paid' WHERE payment_id = ?", (invoice_id,))
+            conn.commit()
+            conn.close()
+            logger.info(f"Invoice {invoice_id} marked as paid")
     return 'OK', 200
 
 # Включить логирование
@@ -50,54 +52,58 @@ CHANNEL_ID = '@H20_shop1'
 # Список админов (добавьте свои user_id)
 ADMINS = [863968972, 551107612]
 
-# XRocket API Token
-XROCKET_TOKEN = '990b34706f156a52746adbb7a'
+# Crypto Pay API Token
+CRYPTO_PAY_TOKEN = '524317:AAEWe7SuOrymzNU31p661wRM6W91DaCejH4'
 
-# XRocket API Token
-XROCKET_TOKEN = '990b34706f156a52746adbb7a'
 
-def create_xrocket_payment(amount, currency='RUB', description='VPN subscription'):
+def create_crypto_pay_invoice(amount, currency='RUB', description='VPN subscription'):
     try:
-        url = 'https://api.xrocket.tg/payments'
+        url = 'https://pay.crypt.bot/api/createInvoice'
         headers = {
-            'Authorization': f'Bearer {XROCKET_TOKEN}',
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'application/json',
-            'Referer': 'https://xrocket.tg/'
+            'Crypto-Pay-API-Token': CRYPTO_PAY_TOKEN,
+            'Content-Type': 'application/json'
         }
         data = {
-            'amount': amount,
-            'currency': currency,
+            'amount': str(amount),
+            'currency_type': 'fiat',
+            'fiat': currency,
             'description': description
         }
         response = requests.post(url, json=data, headers=headers, timeout=10)
-        logger.info(f"XRocket create payment response: {response.status_code} {response.text}")
+        logger.info(f"Crypto Pay create invoice response: {response.status_code} {response.text}")
         if response.status_code == 200:
             result = response.json()
-            return result.get('payment_id'), result.get('payment_url')
+            if result.get('ok'):
+                invoice = result['result']
+                return invoice['invoice_id'], invoice['pay_url']
         return None, None
     except Exception as e:
-        logger.error(f"Error creating XRocket payment: {e}")
+        logger.error(f"Error creating Crypto Pay invoice: {e}")
         return None, None
 
-def get_xrocket_payment_status(payment_id):
+def get_crypto_pay_invoice_status(invoice_id):
     try:
-        url = f'https://api.xrocket.tg/payments/{payment_id}'
+        url = 'https://pay.crypt.bot/api/getInvoices'
         headers = {
-            'Authorization': f'Bearer {XROCKET_TOKEN}',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'application/json',
-            'Referer': 'https://xrocket.tg/'
+            'Crypto-Pay-API-Token': CRYPTO_PAY_TOKEN,
+            'Content-Type': 'application/json'
         }
-        response = requests.get(url, headers=headers, timeout=10)
+        data = {
+            'invoice_ids': invoice_id
+        }
+        response = requests.get(url, headers=headers, params=data, timeout=10)
+        logger.info(f"Crypto Pay get invoices response: {response.status_code} {response.text}")
         if response.status_code == 200:
             result = response.json()
-            return result.get('status', 'unknown')
+            if result.get('ok') and result['result']:
+                invoice = result['result'][0]
+                return invoice['status']
         return 'unknown'
     except Exception as e:
-        logger.error(f"Error getting XRocket payment status: {e}")
+        logger.error(f"Error getting Crypto Pay invoice status: {e}")
         return 'unknown'
+
+
 
 def create_trial_client(user_id):
     try:
@@ -441,6 +447,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         keyboard = [
             [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")],
+            [InlineKeyboardButton("Купить VPN💎", callback_data="buy_vpn")],
             [InlineKeyboardButton("О сервисе📊", callback_data="about")],
             [InlineKeyboardButton("Помощь🆘", callback_data="help")]
         ]
@@ -502,13 +509,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "2️⃣Нажмите \"Проверить оплату\" и получите ключ.Наслаждайтесь быстрой скоростью🔰"
         )
         keyboard = [
-            [InlineKeyboardButton("xRocket pay 🤖", callback_data="pay_1m")],
+            [InlineKeyboardButton("Crypto Pay 🤖", callback_data="pay_1m")],
             [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "pay_1m":
-        payment_id, payment_url = create_xrocket_payment(129, description='VPN subscription 1 month')
+        payment_id, payment_url = create_crypto_pay_invoice(129, description='VPN subscription 1 month')
         if payment_id:
             conn = sqlite3.connect('vpn_bot.db')
             cursor = conn.cursor()
@@ -517,8 +524,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             conn.close()
             message = "Ссылка на оплату ниже⬇️"
             keyboard = [
-                [InlineKeyboardButton("Оплатить", url=payment_url)],
-                [InlineKeyboardButton("Проверить оплату", callback_data="check_payment")],
+                [InlineKeyboardButton("Оплатить | 129 руб.💸", url=payment_url)],
+                [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
+                [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
                 [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -526,20 +534,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             await query.edit_message_text("Ошибка создания платежа.")
     elif data == "buy_3m":
-        # Аналогично для 3 месяцев
         message = (
             "🔢Еще несколько шагов и вы получите стабильный VPN🗿 с быстрейшей скоростью🏎\n"
             "1️⃣Нажмите на кнопку \"Оплатить\" и внесите 299 руб. удобным вам способом и удобной вам валютой.\n"
             "2️⃣Нажмите \"Проверить оплату\" и получите ключ.Наслаждайтесь быстрой скоростью🔰"
         )
         keyboard = [
-            [InlineKeyboardButton("xRocket pay 🤖", callback_data="pay_3m")],
+            [InlineKeyboardButton("Crypto Pay 🤖", callback_data="pay_3m")],
             [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "pay_3m":
-        payment_id, payment_url = create_xrocket_payment(299, description='VPN subscription 3 months')
+        payment_id, payment_url = create_crypto_pay_invoice(299, description='VPN subscription 3 months')
         if payment_id:
             conn = sqlite3.connect('vpn_bot.db')
             cursor = conn.cursor()
@@ -548,8 +555,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             conn.close()
             message = "Ссылка на оплату ниже⬇️"
             keyboard = [
-                [InlineKeyboardButton("Оплатить", url=payment_url)],
-                [InlineKeyboardButton("Проверить оплату", callback_data="check_payment")],
+                [InlineKeyboardButton("Оплатить | 299 руб.💸", url=payment_url)],
+                [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
+                [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
                 [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -563,13 +571,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "2️⃣Нажмите \"Проверить оплату\" и получите ключ.Наслаждайтесь быстрой скоростью🔰"
         )
         keyboard = [
-            [InlineKeyboardButton("xRocket pay 🤖", callback_data="pay_6m")],
+            [InlineKeyboardButton("Crypto Pay 🤖", callback_data="pay_6m")],
             [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "pay_6m":
-        payment_id, payment_url = create_xrocket_payment(499, description='VPN subscription 6 months')
+        payment_id, payment_url = create_crypto_pay_invoice(499, description='VPN subscription 6 months')
         if payment_id:
             conn = sqlite3.connect('vpn_bot.db')
             cursor = conn.cursor()
@@ -578,8 +586,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             conn.close()
             message = "Ссылка на оплату ниже⬇️"
             keyboard = [
-                [InlineKeyboardButton("Оплатить", url=payment_url)],
-                [InlineKeyboardButton("Проверить оплату", callback_data="check_payment")],
+                [InlineKeyboardButton("Оплатить | 499 руб.💸", url=payment_url)],
+                [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
+                [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
                 [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -593,13 +602,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "2️⃣Нажмите \"Проверить оплату\" и получите ключ.Наслаждайтесь быстрой скоростью🔰"
         )
         keyboard = [
-            [InlineKeyboardButton("xRocket pay 🤖", callback_data="pay_12m")],
+            [InlineKeyboardButton("Crypto Pay 🤖", callback_data="pay_12m")],
             [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "pay_12m":
-        payment_id, payment_url = create_xrocket_payment(899, description='VPN subscription 12 months')
+        payment_id, payment_url = create_crypto_pay_invoice(899, description='VPN subscription 12 months')
         if payment_id:
             conn = sqlite3.connect('vpn_bot.db')
             cursor = conn.cursor()
@@ -608,8 +617,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             conn.close()
             message = "Ссылка на оплату ниже⬇️"
             keyboard = [
-                [InlineKeyboardButton("Оплатить", url=payment_url)],
-                [InlineKeyboardButton("Проверить оплату", callback_data="check_payment")],
+                [InlineKeyboardButton("Оплатить | 899 руб.💸", url=payment_url)],
+                [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
+                [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
                 [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -623,7 +633,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         row = cursor.fetchone()
         if row:
             payment_id, amount = row
-            status = get_xrocket_payment_status(payment_id)
+            status = get_crypto_pay_invoice_status(payment_id)
             if status == 'paid':
                 cursor.execute("UPDATE payments SET status = 'paid' WHERE payment_id = ?", (payment_id,))
                 # Определить месяцы
@@ -657,10 +667,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await query.edit_message_text(message, reply_markup=reply_markup)
             else:
                 conn.close()
-                await query.edit_message_text("Оплата не найдена или еще не подтверждена. Попробуйте позже.")
+                # Определить тариф
+                if amount == 129:
+                    pay_callback = "pay_1m"
+                elif amount == 299:
+                    pay_callback = "pay_3m"
+                elif amount == 499:
+                    pay_callback = "pay_6m"
+                elif amount == 899:
+                    pay_callback = "pay_12m"
+                else:
+                    pay_callback = "buy_vpn"
+                await query.edit_message_text("Оплата не найдена или еще не подтверждена.", reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Вернуться к оплате", callback_data=pay_callback)],
+                    [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+                ]))
         else:
             conn.close()
             await query.edit_message_text("Нет ожидающих платежей.")
+    elif data == "cancel_payment":
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM payments WHERE id = (SELECT id FROM payments WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1)", (user_id,))
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        if deleted:
+            await query.edit_message_text("Оплата отменена. Вы можете вернуться и выбрать другой тариф.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться к тарифам", callback_data="buy_vpn")]]))
+        else:
+            await query.edit_message_text("Нет активных платежей для отмены.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
     elif data == "copy_key":
         # Получить ключ из БД
         conn = sqlite3.connect('vpn_bot.db')
@@ -785,6 +820,7 @@ async def main() -> None:
         payment_id TEXT,
         created_at INTEGER
     )''')
+
     # Add columns if not exists
     try:
         cursor.execute("ALTER TABLE users ADD COLUMN trial_notification_sent INTEGER DEFAULT 0")
@@ -798,14 +834,7 @@ async def main() -> None:
         cursor.execute("ALTER TABLE users ADD COLUMN trial_key TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
-    try:
-        cursor.execute("ALTER TABLE payments ADD COLUMN payment_id TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cursor.execute("ALTER TABLE payments ADD COLUMN created_at INTEGER")
-    except sqlite3.OperationalError:
-        pass
+
     conn.commit()
     conn.close()
 
