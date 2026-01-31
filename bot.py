@@ -177,7 +177,7 @@ def create_trial_client(user_id):
             "total": 0,
             "remark": f"Trial {user_id}",
             "enable": True,
-            "expiryTime": 0,
+            "expiryTime": int((time.time() + 259200) * 1000),
             "listen": "",
             "port": port,
             "protocol": "vless",
