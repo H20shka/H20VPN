@@ -12,8 +12,9 @@ import csv
 import io
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram import Update
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import BadRequest
 import requests
 from flask import Flask, request
@@ -741,21 +742,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         cursor = conn.cursor()
         cursor.execute("SELECT subscription_expiry FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
+        cursor.execute("SELECT price FROM tariffs WHERE months = 6")
+        price_row = cursor.fetchone()
         conn.close()
+        if not price_row:
+            await query.edit_message_text("Ошибка: тариф не найден.")
+            return
+        amount = price_row[0]
         current_time = time.time()
         if row and row[0] > current_time:
             await query.edit_message_text("У вас уже есть активная подписка. Дождитесь окончания или обратитесь в поддержку.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
         else:
-            payment_id, payment_url = create_crypto_pay_invoice(499, description='VPN subscription 6 months')
+            payment_id, payment_url = create_crypto_pay_invoice(amount, description='VPN subscription 6 months')
             if payment_id:
                 conn = sqlite3.connect('vpn_bot.db')
                 cursor = conn.cursor()
-                cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", (user_id, 499, 'RUB', 'pending', payment_id, int(time.time())))
+                cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at, months) VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, amount, 'RUB', 'pending', payment_id, int(time.time()), 6))
                 conn.commit()
                 conn.close()
                 message = "Ссылка на оплату ниже⬇️"
                 keyboard = [
-                    [InlineKeyboardButton("Оплатить | 499 руб.💸", url=payment_url)],
+                    [InlineKeyboardButton(f"Оплатить | {int(amount)} руб.💸", url=payment_url)],
                     [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
                     [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
                     [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
@@ -782,21 +789,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         cursor = conn.cursor()
         cursor.execute("SELECT subscription_expiry FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
+        cursor.execute("SELECT price FROM tariffs WHERE months = 12")
+        price_row = cursor.fetchone()
         conn.close()
+        if not price_row:
+            await query.edit_message_text("Ошибка: тариф не найден.")
+            return
+        amount = price_row[0]
         current_time = time.time()
         if row and row[0] > current_time:
             await query.edit_message_text("У вас уже есть активная подписка. Дождитесь окончания или обратитесь в поддержку.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
         else:
-            payment_id, payment_url = create_crypto_pay_invoice(899, description='VPN subscription 12 months')
+            payment_id, payment_url = create_crypto_pay_invoice(amount, description='VPN subscription 12 months')
             if payment_id:
                 conn = sqlite3.connect('vpn_bot.db')
                 cursor = conn.cursor()
-                cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", (user_id, 899, 'RUB', 'pending', payment_id, int(time.time())))
+                cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at, months) VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, amount, 'RUB', 'pending', payment_id, int(time.time()), 12))
                 conn.commit()
                 conn.close()
                 message = "Ссылка на оплату ниже⬇️"
                 keyboard = [
-                    [InlineKeyboardButton("Оплатить | 899 руб.💸", url=payment_url)],
+                    [InlineKeyboardButton(f"Оплатить | {int(amount)} руб.💸", url=payment_url)],
                     [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
                     [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
                     [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
@@ -808,24 +821,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "check_payment":
         conn = sqlite3.connect('vpn_bot.db')
         cursor = conn.cursor()
-        cursor.execute("SELECT payment_id, amount FROM payments WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1", (user_id,))
+        cursor.execute("SELECT payment_id, amount, months FROM payments WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1", (user_id,))
         row = cursor.fetchone()
         if row:
-            payment_id, amount = row
+            payment_id, amount, months = row
             status = get_crypto_pay_invoice_status(payment_id)
             if status == 'paid':
                 cursor.execute("UPDATE payments SET status = 'paid' WHERE payment_id = ?", (payment_id,))
-                # Определить месяцы
-                if amount == 129:
-                    months = 1
-                elif amount == 299:
-                    months = 3
-                elif amount == 499:
-                    months = 6
-                elif amount == 899:
-                    months = 12
-                else:
-                    months = 0
                 if months > 0:
                     expiry_time = int(time.time() + months * 30 * 24 * 3600)
                     cursor.execute("UPDATE users SET subscription_expiry = ? WHERE user_id = ?", (expiry_time, user_id))
@@ -846,14 +848,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await query.edit_message_text(message, reply_markup=reply_markup)
             else:
                 conn.close()
-                # Определить тариф
-                if amount == 129:
+                # Определить тариф для возврата
+                if months == 1:
                     pay_callback = "pay_1m"
-                elif amount == 299:
+                elif months == 3:
                     pay_callback = "pay_3m"
-                elif amount == 499:
+                elif months == 6:
                     pay_callback = "pay_6m"
-                elif amount == 899:
+                elif months == 12:
                     pay_callback = "pay_12m"
                 else:
                     pay_callback = "buy_vpn"
@@ -1270,7 +1272,7 @@ async def main() -> None:
     # Start Flask webhook server in a thread
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000)).start()
 
-    application = ApplicationBuilder().token(TOKEN).build()
+    application = Application(token=TOKEN)
 
     # Добавление обработчика команды /start
     application.add_handler(CommandHandler("start", start))
