@@ -1272,7 +1272,7 @@ async def main() -> None:
     # Start Flask webhook server in a thread
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000)).start()
 
-    application = Application(token=TOKEN)
+    application = Application.builder().token(TOKEN).build()
 
     # Добавление обработчика команды /start
     application.add_handler(CommandHandler("start", start))
