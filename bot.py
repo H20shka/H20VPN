@@ -8,6 +8,8 @@ import asyncio
 import nest_asyncio
 import random
 import base64
+import csv
+import io
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -56,6 +58,14 @@ ADMINS = [863968972, 551107612]
 CRYPTO_PAY_TOKEN = '524317:AAEWe7SuOrymzNU31p661wRM6W91DaCejH4'
 
 
+def log_action(action, user_id, details):
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO logs (timestamp, action, user_id, details) VALUES (?, ?, ?, ?)", (int(time.time()), action, user_id, details))
+    conn.commit()
+    conn.close()
+
+
 def create_crypto_pay_invoice(amount, currency='RUB', description='VPN subscription'):
     try:
         url = 'https://pay.crypt.bot/api/createInvoice'
@@ -89,15 +99,22 @@ def get_crypto_pay_invoice_status(invoice_id):
             'Content-Type': 'application/json'
         }
         data = {
-            'invoice_ids': invoice_id
+            'invoice_ids': [invoice_id]
         }
-        response = requests.get(url, headers=headers, params=data, timeout=10)
+        response = requests.get(url, headers=headers, params=data, timeout=30)
         logger.info(f"Crypto Pay get invoices response: {response.status_code} {response.text}")
         if response.status_code == 200:
             result = response.json()
-            if result.get('ok') and result['result']:
-                invoice = result['result'][0]
+            if result.get('ok') and result['result'] and result['result']['items']:
+                invoice = result['result']['items'][0]
                 return invoice['status']
+            else:
+                logger.error(f"API error: {result}")
+        else:
+            logger.error(f"HTTP error: {response.status_code} {response.text}")
+        return 'unknown'
+    except requests.RequestException as e:
+        logger.error(f"Request error getting Crypto Pay invoice status: {e}")
         return 'unknown'
     except Exception as e:
         logger.error(f"Error getting Crypto Pay invoice status: {e}")
@@ -105,8 +122,9 @@ def get_crypto_pay_invoice_status(invoice_id):
 
 
 
-def create_trial_client(user_id):
+def create_trial_client(user_id, months=3):
     try:
+        expiry_seconds = months * 30 * 24 * 3600  # Примерно месяцы
         base_url = "http://144.31.120.167:54321/dvoykinsecretpanel"
         login_url = f"{base_url}/login"
         login_data = {"username": "H20shka", "password": "aH0908bH?!"}
@@ -138,7 +156,7 @@ def create_trial_client(user_id):
             "email": f"user{user_id}_{int(time.time())}@gmail.com",
             "limitIp": 0,
             "totalGB": 0,
-            "expiryTime": int((time.time() + 259200) * 1000),
+            "expiryTime": int((time.time() + expiry_seconds) * 1000),
             "enable": True,
             "tgId": str(user_id),
             "subId": ""
@@ -175,9 +193,9 @@ def create_trial_client(user_id):
             "up": 0,
             "down": 0,
             "total": 0,
-            "remark": f"Trial {user_id}",
+            "remark": f"Subscription {user_id} {months}m",
             "enable": True,
-            "expiryTime": int((time.time() + 259200) * 1000),
+            "expiryTime": int((time.time() + expiry_seconds) * 1000),
             "listen": "",
             "port": port,
             "protocol": "vless",
@@ -250,6 +268,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     keyboard = [
         [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")],
+        [InlineKeyboardButton("Ваши ключи🔑", callback_data="my_keys")],
         [InlineKeyboardButton("Купить VPN💎", callback_data="buy_vpn")],
         [InlineKeyboardButton("О сервисе📊", callback_data="about")],
         [InlineKeyboardButton("Помощь🆘", callback_data="help")]
@@ -447,6 +466,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         keyboard = [
             [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")],
+            [InlineKeyboardButton("Ваши ключи🔑", callback_data="my_keys")],
             [InlineKeyboardButton("Купить VPN💎", callback_data="buy_vpn")],
             [InlineKeyboardButton("О сервисе📊", callback_data="about")],
             [InlineKeyboardButton("Помощь🆘", callback_data="help")]
@@ -459,6 +479,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if user_id not in ADMINS:
             return
         keyboard = [
+            [InlineKeyboardButton("Статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton("Просмотр платежей", callback_data="admin_payments")],
+            [InlineKeyboardButton("Рассылка", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("Управление тарифами", callback_data="admin_tariffs")],
+            [InlineKeyboardButton("Экспорт данных", callback_data="admin_export")],
+            [InlineKeyboardButton("Резервное копирование", callback_data="admin_backup")],
+            [InlineKeyboardButton("Логи", callback_data="admin_logs")],
+            [InlineKeyboardButton("Настройки", callback_data="admin_settings")],
+            [InlineKeyboardButton("Управление контентом", callback_data="admin_content")],
             [InlineKeyboardButton("Просмотр пользователей", callback_data="admin_users")],
             [InlineKeyboardButton("Заблокировать пользователя", callback_data="admin_ban")],
             [InlineKeyboardButton("Анулировать подписку", callback_data="admin_cancel")],
@@ -487,19 +516,117 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if user_id not in ADMINS:
             return
         await query.edit_message_text("Введите команду /cancel <user_id> для анулирования подписки.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
+    elif data == "admin_stats":
+        if user_id not in ADMINS:
+            return
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users WHERE subscription_expiry > ?", (time.time(),))
+        active_subs = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users WHERE trial_used = 1")
+        trial_used = cursor.fetchone()[0]
+        cursor.execute("SELECT SUM(amount) FROM payments WHERE status = 'paid'")
+        total_revenue = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM users WHERE banned = 1")
+        banned_users = cursor.fetchone()[0]
+        conn.close()
+        message = f"Общее кол-во пользователей: {total_users}\nАктивные подписки: {active_subs}\nИспользовали trial: {trial_used}\nЗаблокированные: {banned_users}\nОбщий доход: {total_revenue} RUB"
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в админку", callback_data="admin")]]))
+    elif data == "admin_payments":
+        if user_id not in ADMINS:
+            return
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, amount, status, created_at FROM payments ORDER BY created_at DESC LIMIT 10")
+        rows = cursor.fetchall()
+        conn.close()
+        message = "Последние платежи:\n" + "\n".join([f"User {r[0]}: {r[1]} RUB, {r[2]}, {time.strftime('%d.%m.%Y %H:%M', time.localtime(r[3]))}" for r in rows])
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в админку", callback_data="admin")]]))
+    elif data == "admin_broadcast":
+        if user_id not in ADMINS:
+            return
+        await query.edit_message_text("Введите команду /broadcast <сообщение> для рассылки.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в админку", callback_data="admin")]]))
+    elif data == "admin_tariffs":
+        if user_id not in ADMINS:
+            return
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT months, price FROM tariffs ORDER BY months")
+        rows = cursor.fetchall()
+        conn.close()
+        message = "Текущие тарифы:\n" + "\n".join([f"{r[0]} мес.: {r[1]} RUB" for r in rows]) + "\n\nКоманды для изменения:\n/setprice1 <цена>\n/setprice3 <цена>\n/setprice6 <цена>\n/setprice12 <цена>"
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в админку", callback_data="admin")]]))
+    elif data == "admin_export":
+        if user_id not in ADMINS:
+            return
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, trial_used, subscription_expiry, banned FROM users")
+        rows = cursor.fetchall()
+        conn.close()
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['user_id', 'trial_used', 'subscription_expiry', 'banned'])
+        writer.writerows(rows)
+        csv_data = output.getvalue()
+        output.close()
+        await context.bot.send_document(chat_id=user_id, document=io.BytesIO(csv_data.encode('utf-8')), filename='users.csv')
+        await query.edit_message_text("CSV файл отправлен.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в админку", callback_data="admin")]]))
+    elif data == "admin_backup":
+        if user_id not in ADMINS:
+            return
+        import shutil
+        shutil.copy('vpn_bot.db', 'backup_vpn_bot.db')
+        with open('backup_vpn_bot.db', 'rb') as f:
+            await context.bot.send_document(chat_id=user_id, document=f, filename='backup_vpn_bot.db')
+        await query.edit_message_text("Резервная копия отправлена.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в админку", callback_data="admin")]]))
+    elif data == "admin_logs":
+        if user_id not in ADMINS:
+            return
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT timestamp, action, user_id, details FROM logs ORDER BY timestamp DESC LIMIT 10")
+        rows = cursor.fetchall()
+        conn.close()
+        message = "Последние логи:\n" + "\n".join([f"{time.strftime('%d.%m.%Y %H:%M', time.localtime(r[0]))}: {r[1]} - User {r[2]} - {r[3]}" for r in rows])
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в админку", callback_data="admin")]]))
+    elif data == "admin_settings":
+        if user_id not in ADMINS:
+            return
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM settings")
+        rows = cursor.fetchall()
+        conn.close()
+        message = "Настройки:\n" + "\n".join([f"{r[0]}: {r[1]}" for r in rows]) + "\n\nКоманды для изменения:\n/setchannel <ID канала>\n/settoken <токен Crypto Pay>"
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в админку", callback_data="admin")]]))
+    elif data == "admin_content":
+        if user_id not in ADMINS:
+            return
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM content")
+        rows = cursor.fetchall()
+        conn.close()
+        message = "Контент:\n" + "\n".join([f"{r[0]}: {r[1][:100]}..." for r in rows]) + "\n\nКоманды для изменения:\n/setwelcome <сообщение>\n/setabout <сообщение>"
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в админку", callback_data="admin")]]))
     elif data == "buy_vpn":
         message = (
             "1️⃣Выберите необходимый тариф.\n"
             "2️⃣Произвидите оплату удобным способом.\n"
             "3️⃣Получите ключ и используйте нам VPN с удовольствием!"
         )
-        keyboard = [
-            [InlineKeyboardButton("🔴1 мес. - 129руб.🔴", callback_data="buy_1m")],
-            [InlineKeyboardButton("🟠3 мес. - 299руб.🟠", callback_data="buy_3m")],
-            [InlineKeyboardButton("🟡6 месяцев - 499руб🟡", callback_data="buy_6m")],
-            [InlineKeyboardButton("🟢12 месяцев - 899 руб.🟢", callback_data="buy_12m")],
-            [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
-        ]
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT months, price FROM tariffs ORDER BY months")
+        rows = cursor.fetchall()
+        conn.close()
+        keyboard = []
+        for months, price in rows:
+            keyboard.append([InlineKeyboardButton(f"�{months} мес. - {int(price)}руб.�", callback_data=f"buy_{months}m")])
+        keyboard.append([InlineKeyboardButton("Вернуться в главное меню", callback_data="back")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "buy_1m":
@@ -515,24 +642,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "pay_1m":
-        payment_id, payment_url = create_crypto_pay_invoice(129, description='VPN subscription 1 month')
-        if payment_id:
-            conn = sqlite3.connect('vpn_bot.db')
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", (user_id, 129, 'RUB', 'pending', payment_id, int(time.time())))
-            conn.commit()
-            conn.close()
-            message = "Ссылка на оплату ниже⬇️"
-            keyboard = [
-                [InlineKeyboardButton("Оплатить | 129 руб.💸", url=payment_url)],
-                [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
-                [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
-                [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(message, reply_markup=reply_markup)
+        # Проверить активную подписку
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT subscription_expiry FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        cursor.execute("SELECT price FROM tariffs WHERE months = 1")
+        price_row = cursor.fetchone()
+        conn.close()
+        if not price_row:
+            await query.edit_message_text("Ошибка: тариф не найден.")
+            return
+        amount = price_row[0]
+        current_time = time.time()
+        if row and row[0] > current_time:
+            await query.edit_message_text("У вас уже есть активная подписка. Дождитесь окончания или обратитесь в поддержку.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
         else:
-            await query.edit_message_text("Ошибка создания платежа.")
+            payment_id, payment_url = create_crypto_pay_invoice(amount, description='VPN subscription 1 month')
+            if payment_id:
+                conn = sqlite3.connect('vpn_bot.db')
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", (user_id, amount, 'RUB', 'pending', payment_id, int(time.time())))
+                conn.commit()
+                conn.close()
+                message = "Ссылка на оплату ниже⬇️"
+                keyboard = [
+                    [InlineKeyboardButton(f"Оплатить | {int(amount)} руб.💸", url=payment_url)],
+                    [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
+                    [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
+                    [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(message, reply_markup=reply_markup)
+            else:
+                await query.edit_message_text("Ошибка создания платежа.")
     elif data == "buy_3m":
         message = (
             "🔢Еще несколько шагов и вы получите стабильный VPN🗿 с быстрейшей скоростью🏎\n"
@@ -546,24 +689,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "pay_3m":
-        payment_id, payment_url = create_crypto_pay_invoice(299, description='VPN subscription 3 months')
-        if payment_id:
-            conn = sqlite3.connect('vpn_bot.db')
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", (user_id, 299, 'RUB', 'pending', payment_id, int(time.time())))
-            conn.commit()
-            conn.close()
-            message = "Ссылка на оплату ниже⬇️"
-            keyboard = [
-                [InlineKeyboardButton("Оплатить | 299 руб.💸", url=payment_url)],
-                [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
-                [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
-                [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(message, reply_markup=reply_markup)
+        # Проверить активную подписку
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT subscription_expiry FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        cursor.execute("SELECT price FROM tariffs WHERE months = 3")
+        price_row = cursor.fetchone()
+        conn.close()
+        if not price_row:
+            await query.edit_message_text("Ошибка: тариф не найден.")
+            return
+        amount = price_row[0]
+        current_time = time.time()
+        if row and row[0] > current_time:
+            await query.edit_message_text("У вас уже есть активная подписка. Дождитесь окончания или обратитесь в поддержку.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
         else:
-            await query.edit_message_text("Ошибка создания платежа.")
+            payment_id, payment_url = create_crypto_pay_invoice(amount, description='VPN subscription 3 months')
+            if payment_id:
+                conn = sqlite3.connect('vpn_bot.db')
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at, months) VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, amount, 'RUB', 'pending', payment_id, int(time.time()), 3))
+                conn.commit()
+                conn.close()
+                message = "Ссылка на оплату ниже⬇️"
+                keyboard = [
+                    [InlineKeyboardButton(f"Оплатить | {int(amount)} руб.💸", url=payment_url)],
+                    [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
+                    [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
+                    [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(message, reply_markup=reply_markup)
+            else:
+                await query.edit_message_text("Ошибка создания платежа.")
     elif data == "buy_6m":
         message = (
             "🔢Еще несколько шагов и вы получите стабильный VPN🗿 с быстрейшей скоростью🏎\n"
@@ -577,24 +736,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "pay_6m":
-        payment_id, payment_url = create_crypto_pay_invoice(499, description='VPN subscription 6 months')
-        if payment_id:
-            conn = sqlite3.connect('vpn_bot.db')
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", (user_id, 499, 'RUB', 'pending', payment_id, int(time.time())))
-            conn.commit()
-            conn.close()
-            message = "Ссылка на оплату ниже⬇️"
-            keyboard = [
-                [InlineKeyboardButton("Оплатить | 499 руб.💸", url=payment_url)],
-                [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
-                [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
-                [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(message, reply_markup=reply_markup)
+        # Проверить активную подписку
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT subscription_expiry FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        current_time = time.time()
+        if row and row[0] > current_time:
+            await query.edit_message_text("У вас уже есть активная подписка. Дождитесь окончания или обратитесь в поддержку.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
         else:
-            await query.edit_message_text("Ошибка создания платежа.")
+            payment_id, payment_url = create_crypto_pay_invoice(499, description='VPN subscription 6 months')
+            if payment_id:
+                conn = sqlite3.connect('vpn_bot.db')
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", (user_id, 499, 'RUB', 'pending', payment_id, int(time.time())))
+                conn.commit()
+                conn.close()
+                message = "Ссылка на оплату ниже⬇️"
+                keyboard = [
+                    [InlineKeyboardButton("Оплатить | 499 руб.💸", url=payment_url)],
+                    [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
+                    [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
+                    [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(message, reply_markup=reply_markup)
+            else:
+                await query.edit_message_text("Ошибка создания платежа.")
     elif data == "buy_12m":
         message = (
             "🔢Еще несколько шагов и вы получите стабильный VPN🗿 с быстрейшей скоростью🏎\n"
@@ -608,24 +777,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "pay_12m":
-        payment_id, payment_url = create_crypto_pay_invoice(899, description='VPN subscription 12 months')
-        if payment_id:
-            conn = sqlite3.connect('vpn_bot.db')
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", (user_id, 899, 'RUB', 'pending', payment_id, int(time.time())))
-            conn.commit()
-            conn.close()
-            message = "Ссылка на оплату ниже⬇️"
-            keyboard = [
-                [InlineKeyboardButton("Оплатить | 899 руб.💸", url=payment_url)],
-                [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
-                [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
-                [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(message, reply_markup=reply_markup)
+        # Проверить активную подписку
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT subscription_expiry FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        current_time = time.time()
+        if row and row[0] > current_time:
+            await query.edit_message_text("У вас уже есть активная подписка. Дождитесь окончания или обратитесь в поддержку.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
         else:
-            await query.edit_message_text("Ошибка создания платежа.")
+            payment_id, payment_url = create_crypto_pay_invoice(899, description='VPN subscription 12 months')
+            if payment_id:
+                conn = sqlite3.connect('vpn_bot.db')
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", (user_id, 899, 'RUB', 'pending', payment_id, int(time.time())))
+                conn.commit()
+                conn.close()
+                message = "Ссылка на оплату ниже⬇️"
+                keyboard = [
+                    [InlineKeyboardButton("Оплатить | 899 руб.💸", url=payment_url)],
+                    [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
+                    [InlineKeyboardButton("Отменить оплату❌", callback_data="cancel_payment")],
+                    [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(message, reply_markup=reply_markup)
+            else:
+                await query.edit_message_text("Ошибка создания платежа.")
     elif data == "check_payment":
         conn = sqlite3.connect('vpn_bot.db')
         cursor = conn.cursor()
@@ -653,11 +832,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     conn.commit()
                     # Создать ключ, аналогично trial
                     loop = asyncio.get_event_loop()
-                    key = await loop.run_in_executor(None, create_trial_client, user_id)
+                    key = await loop.run_in_executor(None, create_trial_client, user_id, months)
                     if key.startswith("vless://"):
                         cursor.execute("UPDATE users SET trial_key = ? WHERE user_id = ?", (key, user_id))
                         conn.commit()
-                        message = f"Оплата подтверждена! Подписка активирована на {months} месяцев. Ключ: {key}"
+                        message = f"Оплата подтверждена! Подписка активирована на {months} месяцев. Ключ: <code>{key}</code>"
                     else:
                         message = f"Оплата подтверждена! Подписка активирована на {months} месяцев. Ошибка генерации ключа: {key}"
                 else:
@@ -685,6 +864,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             conn.close()
             await query.edit_message_text("Нет ожидающих платежей.")
+    elif data == "my_keys":
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT subscription_expiry, trial_key FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        current_time = time.time()
+        subscription_active = row and row[0] > current_time
+        key = row[1] if row else None
+        if subscription_active and key:
+            date_str = time.strftime('%d.%m.%Y %H:%M', time.localtime(row[0]))
+            message = f"Ваша подписка активна до {date_str}.\n🔑Ключ:\n<code>{key}</code>"
+            keyboard = [
+                [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+            ]
+        elif subscription_active:
+            date_str = time.strftime('%d.%m.%Y %H:%M', time.localtime(row[0]))
+            message = f"Ваша подписка активна до {date_str}, но ключ не найден."
+            keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        else:
+            message = "У вас нет активной подписки."
+            keyboard = [
+                [InlineKeyboardButton("Купить VPN💎", callback_data="buy_vpn")],
+                [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+            ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='HTML')
     elif data == "cancel_payment":
         conn = sqlite3.connect('vpn_bot.db')
         cursor = conn.cursor()
@@ -705,7 +911,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         conn.close()
         if row and row[0]:
             await query.answer()
-            await update.callback_query.message.reply_text(f"```{row[0]}```", parse_mode='MarkdownV2')
+            # Экранировать специальные символы для MarkdownV2
+            escaped_key = row[0].replace('.', '\.').replace('-', '\-').replace('_', '\_').replace('*', '\*').replace('[', '\[').replace(']', '\]').replace('(', '\(').replace(')', '\)').replace('~', '\~').replace('`', '\`').replace('>', '\>').replace('#', '\#').replace('+', '\+').replace('=', '\=').replace('|', '\|').replace('{', '\{').replace('}', '\}').replace('!', '\!').replace('?', '\?')
+            await update.callback_query.message.reply_text(f"```{escaped_key}```", parse_mode='MarkdownV2')
         else:
             await query.answer("Ключ не найден.")
 
@@ -726,6 +934,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     cursor.execute("UPDATE users SET banned = 1 WHERE user_id = ?", (target_id,))
     conn.commit()
     conn.close()
+    log_action("ban", target_id, f"Admin {update.message.from_user.id}")
     await update.message.reply_text(f"Пользователь {target_id} заблокирован.")
 
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -745,6 +954,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     cursor.execute("UPDATE users SET banned = 0 WHERE user_id = ?", (target_id,))
     conn.commit()
     conn.close()
+    log_action("unban", target_id, f"Admin {update.message.from_user.id}")
     await update.message.reply_text(f"Пользователь {target_id} разблокирован.")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -764,6 +974,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     cursor.execute("UPDATE users SET subscription_expiry = 0 WHERE user_id = ?", (target_id,))
     conn.commit()
     conn.close()
+    log_action("cancel_subscription", target_id, f"Admin {update.message.from_user.id}")
     await update.message.reply_text(f"Подписка пользователя {target_id} анулирована.")
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -780,6 +991,173 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         status = "Заблокирован" if row[3] else ("Активен" if row[2] > time.time() else "Неактивен")
         message += f"ID: {row[0]}, Trial: {'Да' if row[1] else 'Нет'}, Status: {status}\n"
     await update.message.reply_text(message[:4000])
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /broadcast <сообщение>")
+        return
+    message = ' '.join(context.args)
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users WHERE banned = 0")
+    rows = cursor.fetchall()
+    conn.close()
+    sent = 0
+    for (user_id,) in rows:
+        try:
+            await update.get_bot().send_message(chat_id=user_id, text=message)
+            sent += 1
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
+    log_action("broadcast", update.message.from_user.id, f"Sent to {sent} users")
+    await update.message.reply_text(f"Сообщение отправлено {sent} пользователям.")
+
+async def setprice1_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Использование: /setprice1 <цена>")
+        return
+    try:
+        price = float(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Неверная цена.")
+        return
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE tariffs SET price = ? WHERE months = 1", (price,))
+    conn.commit()
+    conn.close()
+    log_action("set_price", 0, f"1 month: {price}")
+    await update.message.reply_text(f"Цена за 1 месяц установлена на {price} RUB.")
+
+async def setprice3_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Использование: /setprice3 <цена>")
+        return
+    try:
+        price = float(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Неверная цена.")
+        return
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE tariffs SET price = ? WHERE months = 3", (price,))
+    conn.commit()
+    conn.close()
+    log_action("set_price", 0, f"3 months: {price}")
+    await update.message.reply_text(f"Цена за 3 месяца установлена на {price} RUB.")
+
+async def setprice6_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Использование: /setprice6 <цена>")
+        return
+    try:
+        price = float(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Неверная цена.")
+        return
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE tariffs SET price = ? WHERE months = 6", (price,))
+    conn.commit()
+    conn.close()
+    log_action("set_price", 0, f"6 months: {price}")
+    await update.message.reply_text(f"Цена за 6 месяцев установлена на {price} RUB.")
+
+async def setprice12_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Использование: /setprice12 <цена>")
+        return
+    try:
+        price = float(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Неверная цена.")
+        return
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE tariffs SET price = ? WHERE months = 12", (price,))
+    conn.commit()
+    conn.close()
+    log_action("set_price", 0, f"12 months: {price}")
+    await update.message.reply_text(f"Цена за 12 месяцев установлена на {price} RUB.")
+
+async def setchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Использование: /setchannel <ID канала>")
+        return
+    channel_id = context.args[0]
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE settings SET value = ? WHERE key = 'channel_id'", (channel_id,))
+    conn.commit()
+    conn.close()
+    log_action("set_channel", 0, f"Channel ID: {channel_id}")
+    await update.message.reply_text(f"ID канала установлен на {channel_id}.")
+
+async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Использование: /settoken <токен>")
+        return
+    token = context.args[0]
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE settings SET value = ? WHERE key = 'crypto_pay_token'", (token,))
+    conn.commit()
+    conn.close()
+    log_action("set_token", 0, "Crypto Pay token updated")
+    await update.message.reply_text("Токен Crypto Pay обновлен.")
+
+async def setwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /setwelcome <сообщение>")
+        return
+    message = ' '.join(context.args)
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE content SET value = ? WHERE key = 'welcome_message'", (message,))
+    conn.commit()
+    conn.close()
+    log_action("set_welcome", 0, "Welcome message updated")
+    await update.message.reply_text("Приветственное сообщение обновлено.")
+
+async def setabout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.from_user.id not in ADMINS:
+        await update.message.reply_text("У вас нет прав.")
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /setabout <сообщение>")
+        return
+    message = ' '.join(context.args)
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE content SET value = ? WHERE key = 'about_message'", (message,))
+    conn.commit()
+    conn.close()
+    log_action("set_about", 0, "About message updated")
+    await update.message.reply_text("Сообщение о сервисе обновлено.")
 
 async def check_trial_expiry(application):
     """Проверяет истекшие пробные периоды и отправляет уведомления."""
@@ -818,8 +1196,55 @@ async def main() -> None:
         currency TEXT,
         status TEXT,
         payment_id TEXT,
-        created_at INTEGER
+        created_at INTEGER,
+        months INTEGER
     )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS tariffs (
+        id INTEGER PRIMARY KEY,
+        months INTEGER,
+        price REAL
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER,
+        action TEXT,
+        user_id INTEGER,
+        details TEXT
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS content (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
+
+    # Insert default tariffs if empty
+    cursor.execute("SELECT COUNT(*) FROM tariffs")
+    if cursor.fetchone()[0] == 0:
+        cursor.executemany("INSERT INTO tariffs (id, months, price) VALUES (?, ?, ?)", [
+            (1, 1, 129),
+            (2, 3, 299),
+            (3, 6, 499),
+            (4, 12, 899)
+        ])
+
+    # Insert default settings if empty
+    cursor.execute("SELECT COUNT(*) FROM settings")
+    if cursor.fetchone()[0] == 0:
+        cursor.executemany("INSERT INTO settings (key, value) VALUES (?, ?)", [
+            ('channel_id', CHANNEL_ID),
+            ('crypto_pay_token', CRYPTO_PAY_TOKEN)
+        ])
+
+    # Insert default content if empty
+    cursor.execute("SELECT COUNT(*) FROM content")
+    if cursor.fetchone()[0] == 0:
+        cursor.executemany("INSERT INTO content (key, value) VALUES (?, ?)", [
+            ('welcome_message', "Привет👋\n\nМы работаем и наша команда готова освободить Вас от:\n\nЗависающих видео в запрещённой сети;\nБесконечного просмотра рекламы;\nБлокировки из-за частой смены IP-адреса;\nУтечки заряда батареи и ваших данных (как у бесплатных VPN)."),
+            ('about_message', "Мы предоставляем VPN с самой высокой скоростью и комфортной настройкой за считанные секунды.\n\nКоличество активных пользователей-{active_users}🧮;\nСколько мы уже работаем-мы работаем для вас каждый день с 02.11.2025🗓;\nАктивная поддержка 24/7📩;\nВысокая скорость и доступность нескольких локаций🏎;")
+        ])
 
     # Add columns if not exists
     try:
@@ -832,6 +1257,10 @@ async def main() -> None:
         pass
     try:
         cursor.execute("ALTER TABLE users ADD COLUMN trial_key TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE payments ADD COLUMN months INTEGER")
     except sqlite3.OperationalError:
         pass
 
@@ -854,6 +1283,15 @@ async def main() -> None:
     application.add_handler(CommandHandler("unban", unban_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("setprice1", setprice1_command))
+    application.add_handler(CommandHandler("setprice3", setprice3_command))
+    application.add_handler(CommandHandler("setprice6", setprice6_command))
+    application.add_handler(CommandHandler("setprice12", setprice12_command))
+    application.add_handler(CommandHandler("setchannel", setchannel_command))
+    application.add_handler(CommandHandler("settoken", settoken_command))
+    application.add_handler(CommandHandler("setwelcome", setwelcome_command))
+    application.add_handler(CommandHandler("setabout", setabout_command))
 
     # Запустить фоновую задачу для проверки истекших пробных периодов
     asyncio.create_task(check_trial_expiry(application))
