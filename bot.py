@@ -12,9 +12,9 @@ import csv
 import io
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
-from telegram import Update
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, WebAppInfo
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, PreCheckoutQueryHandler, MessageHandler, ContextTypes, filters
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice
 from telegram.error import BadRequest
 import requests
 from flask import Flask, request
@@ -24,6 +24,95 @@ nest_asyncio.apply()
 
 # Flask app for webhook
 app = Flask(__name__)
+
+# ============ WEB APP API ============
+@app.route('/webapp')
+def webapp():
+    """Показать веб-приложение"""
+    return open('webapp/index.html').read()
+
+@app.route('/api/user_data')
+def api_user_data():
+    """API: получить данные пользователя"""
+    try:
+        user_id = int(request.args.get('user_id', 0))
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT subscription_expiry, server FROM users WHERE user_id = ?", (user_id,))
+        user_row = cursor.fetchone()
+        
+        cursor.execute("SELECT id, key_name, key_uri, expiry_time FROM keys WHERE user_id = ? AND is_active = 1", (user_id,))
+        keys = cursor.fetchall()
+        conn.close()
+        
+        current_time = time.time()
+        subscription_active = user_row and user_row[0] > current_time
+        
+        keys_data = []
+        for key_id, key_name, key_uri, expiry_time in keys:
+            days_left = (expiry_time - current_time) / (24 * 3600)
+            keys_data.append({
+                'id': key_id,
+                'name': key_name,
+                'uri': key_uri,
+                'days_left': int(days_left),
+                'traffic': None  # Можно добавить статистику
+            })
+        
+        return json.dumps({
+            'success': True,
+            'user': {
+                'subscription_active': subscription_active,
+                'subscription_expiry': user_row[0] if user_row else 0,
+                'server': user_row[1] if user_row else 'germany'
+            },
+            'keys': keys_data
+        })
+    except Exception as e:
+        return json.dumps({'success': False, 'error': str(e)})
+
+@app.route('/api/create_key')
+def api_create_key():
+    """API: создать новый ключ"""
+    try:
+        user_id = int(request.args.get('user_id', 0))
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT subscription_expiry FROM users WHERE user_id = ?", (user_id,))
+        user_row = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*) FROM keys WHERE user_id = ? AND is_active = 1", (user_id,))
+        keys_count = cursor.fetchone()[0]
+        conn.close()
+        
+        current_time = time.time()
+        if not user_row or user_row[0] < current_time:
+            return json.dumps({'success': False, 'error': 'Нет активной подписки'})
+        
+        # Генерируем имя ключа
+        names = ['Телефон', 'Ноутбук', 'ПК', 'Планшет', 'Роутер', 'ТВ']
+        key_name = names[keys_count] if keys_count < len(names) else f'Ключ {keys_count + 1}'
+        
+        months_left = (user_row[0] - current_time) / (30 * 24 * 3600)
+        months = max(1, int(months_left))
+        
+        uri, client_id = create_vpn_key(user_id, months, key_name)
+        
+        if uri:
+            conn = sqlite3.connect('vpn_bot.db')
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO keys (user_id, key_name, key_uri, client_id, created_at, expiry_time) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, key_name, uri, client_id, int(current_time), user_row[0])
+            )
+            conn.commit()
+            conn.close()
+            return json.dumps({'success': True, 'key_name': key_name, 'uri': uri})
+        else:
+            return json.dumps({'success': False, 'error': client_id})
+    except Exception as e:
+        return json.dumps({'success': False, 'error': str(e)})
 
 @app.route('/crypto_webhook', methods=['POST'])
 def crypto_webhook():
@@ -42,6 +131,176 @@ def crypto_webhook():
             logger.info(f"Invoice {invoice_id} marked as paid")
     return 'OK', 200
 
+# ============ TELEGRAM STARS WEBHOOK ============
+@app.route('/stars_webhook', methods=['POST'])
+def stars_webhook():
+    """Webhook для обработки платежей Telegram Stars"""
+    try:
+        data = request.get_json()
+        logger.info(f"Telegram Stars webhook received: {data}")
+        
+        # Проверяем тип обновления
+        update_type = data.get('update_type')
+        
+        if update_type == 'payment_transaction':
+            transaction = data.get('payload', {}).get('transaction', {})
+            provider_payment_charge_id = transaction.get('provider_payment_charge_id')
+            amount = transaction.get('amount')
+            
+            # Найти пользователя по payment_charge_id
+            if provider_payment_charge_id:
+                conn = sqlite3.connect('vpn_bot.db')
+                cursor = conn.cursor()
+                cursor.execute("SELECT user_id, months FROM payments WHERE payment_id = ?", (provider_payment_charge_id,))
+                row = cursor.fetchone()
+                
+                if row:
+                    user_id, months = row
+                    # Обновить статус платежа
+                    cursor.execute("UPDATE payments SET status = 'paid' WHERE payment_id = ?", (provider_payment_charge_id,))
+                    
+                    if months > 0:
+                        expiry_time = int(time.time() + months * 30 * 24 * 3600)
+                        cursor.execute("UPDATE users SET subscription_expiry = ? WHERE user_id = ?", (expiry_time, user_id))
+                        
+                        # Создать ключ
+                        from bot import create_trial_client
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        key = loop.run_until_complete(create_trial_client(user_id, months))
+                        if key.startswith("vless://"):
+                            cursor.execute("UPDATE users SET trial_key = ? WHERE user_id = ?", (key, user_id))
+                        loop.close()
+                    
+                    conn.commit()
+                    conn.close()
+                    logger.info(f"Stars payment {provider_payment_charge_id} confirmed for user {user_id}")
+                    
+                    # Отправить уведомление пользователю
+                    try:
+                        from telegram import Bot
+                        bot = Bot(token=TOKEN)
+                        if months > 0:
+                            bot.send_message(chat_id=user_id, text=f"✅ Оплата Telegram Stars подтверждена! Подписка на {months} мес. активирована.")
+                        else:
+                            bot.send_message(chat_id=user_id, text="✅ Оплата Telegram Stars подтверждена!")
+                    except Exception as e:
+                        logger.error(f"Failed to send Stars payment confirmation: {e}")
+        
+        return 'OK', 200
+    except Exception as e:
+        logger.error(f"Stars webhook error: {e}")
+        return 'Error', 500
+
+
+def create_telegram_stars_invoice(user_id, months, stars_amount):
+    """Создание счёта Telegram Stars через Bot API"""
+    try:
+        # Генерируем уникальный ID платежа
+        payment_id = f"stars_{user_id}_{int(time.time())}_{random.randint(1000, 9999)}"
+        
+        # Сохраняем информацию о платеже в БД
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at, months) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, stars_amount, 'STARS', 'pending', payment_id, int(time.time()), months)
+        )
+        conn.commit()
+        conn.close()
+        
+        return payment_id
+    except Exception as e:
+        logger.error(f"Error creating Stars invoice: {e}")
+        return None
+
+
+async def pre_checkout_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка PreCheckout запроса для Telegram Stars"""
+    query = update.pre_checkout_query
+    # Всегда подтверждаем запрос
+    await context.bot.answer_pre_checkout_query(pre_checkout_query_id=query.id, ok=True)
+
+
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка успешного платежа Telegram Stars"""
+    payment = update.message.successful_payment
+    
+    # Получаем payload и Telegram payment charge ID
+    payload = payment.payload
+    telegram_payment_charge_id = payment.telegram_payment_charge_id
+    
+    logger.info(f"Successful payment received: payload={payload}, charge_id={telegram_payment_charge_id}")
+    
+    # Парсим payload: stars_{user_id}_{months}_{timestamp}
+    try:
+        parts = payload.split('_')
+        if len(parts) >= 3:
+            user_id = int(parts[1])
+            months = int(parts[2])
+        else:
+            # Fallback - ищем в БД по charge_id
+            conn = sqlite3.connect('vpn_bot.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id, months FROM payments WHERE payment_id = ?", (payload,))
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                user_id, months = row
+            else:
+                logger.error(f"Cannot parse payload: {payload}")
+                return
+    except Exception as e:
+        logger.error(f"Error parsing payment payload: {e}")
+        return
+    
+    # Обновляем статус платежа в БД
+    conn = sqlite3.connect('vpn_bot.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at, months) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, payment.total_amount, 'STARS', 'paid', telegram_payment_charge_id, int(time.time()), months)
+    )
+    
+    if months > 0:
+        expiry_time = int(time.time() + months * 30 * 24 * 3600)
+        cursor.execute("UPDATE users SET subscription_expiry = ? WHERE user_id = ?", (expiry_time, user_id))
+        
+        # Создать ключ
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        key = loop.run_until_complete(create_trial_client(user_id, months))
+        if key.startswith("vless://"):
+            cursor.execute("UPDATE users SET trial_key = ? WHERE user_id = ?", (key, user_id))
+        loop.close()
+    
+    conn.commit()
+    conn.close()
+    
+    # Отправляем подтверждение пользователю
+    try:
+        if months > 0:
+            context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ Оплата Telegram Stars подтверждена!\n\nПодписка на {months} мес. активирована."
+            )
+        else:
+            context.bot.send_message(
+                chat_id=user_id,
+                text="✅ Оплата Telegram Stars подтверждена!"
+            )
+    except Exception as e:
+        logger.error(f"Failed to send payment confirmation: {e}")
+
+
+def create_stars_invoice_message(months, stars_amount):
+    """Создание клавиатуры для оплаты Stars"""
+    keyboard = [
+        [InlineKeyboardButton(f"Оплатить {stars_amount} ⭐️", callback_data=f"pay_stars_{months}m")],
+        [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 # Включить логирование
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -57,6 +316,26 @@ ADMINS = [863968972, 551107612]
 
 # Crypto Pay API Token
 CRYPTO_PAY_TOKEN = '524317:AAEWe7SuOrymzNU31p661wRM6W91DaCejH4'
+
+# Telegram Stars Payment
+TELEGRAM_STARS_PRICES = {
+    1: 119,    # 1 месяц = 119 Stars
+    3: 229,    # 3 месяца = 229 Stars
+    6: 499,    # 6 месяцев = 499 Stars
+    12: 849    # 12 месяцев = 849 Stars
+}
+
+# Available VPN Servers / Locations
+VPN_SERVERS = {
+    "germany": {
+        "name": "🇩🇪 Германия",
+        "ip": "144.31.120.167",
+        "port_range": "10000-20000"
+    }
+}
+
+# Default server
+DEFAULT_SERVER = "germany"
 
 
 def log_action(action, user_id, details):
@@ -123,38 +402,48 @@ def get_crypto_pay_invoice_status(invoice_id):
 
 
 
-def create_trial_client(user_id, months=3):
+def get_session():
+    """Получить сессию x-ui с авторизацией"""
+    base_url = "http://144.31.120.167:54321/dvoykinsecretpanel"
+    login_url = f"{base_url}/login"
+    login_data = {"username": "H20shka", "password": "aH0908bH?!"}
+    session = requests.Session()
+    response = session.post(login_url, data=login_data)
+    if response.status_code != 200:
+        return None
+    return session
+
+
+def create_vpn_key(user_id, months=3, key_name=None):
+    """Создать новый VPN ключ"""
     try:
-        expiry_seconds = months * 30 * 24 * 3600  # Примерно месяцы
-        base_url = "http://144.31.120.167:54321/dvoykinsecretpanel"
-        login_url = f"{base_url}/login"
-        login_data = {"username": "H20shka", "password": "aH0908bH?!"}
-        session = requests.Session()
-        response = session.post(login_url, data=login_data)
-        if response.status_code != 200:
-            return f"Ошибка авторизации: {response.status_code}"
+        expiry_seconds = months * 30 * 24 * 3600
+        session = get_session()
+        if not session:
+            return None, "Ошибка подключения к x-ui"
 
         # Получить шаблон inbound
         template_inbound_id = 1203
-        get_inbound_url = f"{base_url}/panel/api/inbounds/get/{template_inbound_id}"
+        get_inbound_url = f"http://144.31.120.167:54321/dvoykinsecretpanel/panel/api/inbounds/get/{template_inbound_id}"
         response = session.get(get_inbound_url)
-        if response.status_code != 200:
-            return f"Ошибка получения inbound: {response.status_code}"
-
+        
         try:
             inbound_response = response.json()
             if not inbound_response.get('success'):
-                return "Inbound id=1203 не найден"
-            template_inbound = inbound_response['obj']
-        except json.JSONDecodeError:
-            return f"Ошибка: ответ не является JSON: {response.text}"
+                return None, "Inbound не найден"
+        except:
+            return None, "Ошибка получения inbound"
 
         # Создать нового клиента
         client_id = str(uuid.uuid4())
+        client_email = f"user{user_id}_{int(time.time())}"
+        if key_name:
+            client_email = f"{key_name}_{user_id}"
+        
         client = {
             "id": client_id,
             "flow": "xtls-rprx-vision",
-            "email": f"user{user_id}_{int(time.time())}@gmail.com",
+            "email": client_email,
             "limitIp": 0,
             "totalGB": 0,
             "expiryTime": int((time.time() + expiry_seconds) * 1000),
@@ -163,10 +452,8 @@ def create_trial_client(user_id, months=3):
             "subId": ""
         }
 
-        # Создать новый inbound
+        # Настройки
         port = random.randint(10000, 20000)
-
-        # Использовать предоставленные ключи
         private_key_b64 = "aB5BtDQgMyKc-R7wew7L6aHD3MxQO59X0gWJDbDC60I"
         public_key_b64 = "WkV5D_PHJ-wMZL3pV24EA2uZZDj35Knkaaj8Odtyh2U"
 
@@ -185,16 +472,15 @@ def create_trial_client(user_id, months=3):
             },
             "tcpSettings": {
                 "acceptProxyProtocol": False,
-                "header": {
-                    "type": "none"
-                }
+                "header": {"type": "none"}
             }
         }
+
         new_inbound = {
             "up": 0,
             "down": 0,
             "total": 0,
-            "remark": f"Subscription {user_id} {months}m",
+            "remark": f"{key_name or 'VPN'} {user_id}",
             "enable": True,
             "expiryTime": int((time.time() + expiry_seconds) * 1000),
             "listen": "",
@@ -205,24 +491,72 @@ def create_trial_client(user_id, months=3):
             "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"]})
         }
 
-        add_inbound_url = f"{base_url}/panel/api/inbounds/add"
+        add_inbound_url = "http://144.31.120.167:54321/dvoykinsecretpanel/panel/api/inbounds/add"
         response = session.post(add_inbound_url, json=new_inbound)
+        
         if response.status_code == 200:
-            try:
-                add_response = response.json()
-                if add_response.get('success'):
-                    # Использовать сгенерированные ключи для URI
-                    server = "144.31.120.167"
-                    uri = f"vless://{client_id}@{server}:{port}?type=tcp&encryption=none&security=reality&pbk={public_key_b64}&fp=chrome&sni=google.com&sid=&spx=%2F#H2O"
-                    return uri
-                else:
-                    return f"Ошибка создания inbound: {add_response}"
-            except json.JSONDecodeError:
-                return f"Ошибка: ответ не является JSON: {response.text}"
+            result = response.json()
+            if result.get('success'):
+                server = "144.31.120.167"
+                uri = f"vless://{client_id}@{server}:{port}?type=tcp&encryption=none&security=reality&pbk={public_key_b64}&fp=chrome&sni=google.com&sid=&spx=%2F#{key_name or 'VPN'}"
+                return uri, client_id
+            else:
+                return None, f"Ошибка: {result}"
         else:
-            return f"Ошибка создания inbound: {response.status_code} {response.text}"
+            return None, f"HTTP ошибка: {response.status_code}"
     except Exception as e:
-        return f"Ошибка: {str(e)}"
+        return None, f"Исключение: {str(e)}"
+
+
+def get_key_statistics(client_id):
+    """Получить статистику использования ключа"""
+    try:
+        session = get_session()
+        if not session:
+            return None
+
+        # Получаем все inbounds
+        inbounds_url = "http://144.31.120.167:54321/dvoykinsecretpanel/panel/api/inbounds/list"
+        response = session.get(inbounds_url)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('success'):
+                inbounds = result.get('obj', [])
+                for inbound in inbounds:
+                    settings = json.loads(inbound.get('settings', '{}'))
+                    clients = settings.get('clients', [])
+                    for client in clients:
+                        if client.get('id') == client_id:
+                            return {
+                                'up': inbound.get('up', 0),
+                                'down': inbound.get('down', 0),
+                                'total': inbound.get('total', 0),
+                                'enable': client.get('enable', True),
+                                'expiryTime': client.get('expiryTime', 0)
+                            }
+            return None
+        return None
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return None
+
+
+def format_bytes(bytes_num):
+    """Форматировать байты в читаемый вид"""
+    for unit in ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ']:
+        if bytes_num < 1024.0:
+            return f"{bytes_num:.2f} {unit}"
+        bytes_num /= 1024.0
+    return f"{bytes_num:.2f} ПБ"
+
+
+def create_trial_client(user_id, months=3):
+    """Создать пробный ключ (обратная совместимость)"""
+    uri, client_id = create_vpn_key(user_id, months)
+    if uri:
+        return uri
+    return f"Ошибка: {client_id}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет приветственное сообщение при команде /start."""
@@ -271,6 +605,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")],
         [InlineKeyboardButton("Ваши ключи🔑", callback_data="my_keys")],
         [InlineKeyboardButton("Купить VPN💎", callback_data="buy_vpn")],
+        [InlineKeyboardButton("Сервер🌍", callback_data="server")],
         [InlineKeyboardButton("О сервисе📊", callback_data="about")],
         [InlineKeyboardButton("Помощь🆘", callback_data="help")]
     ]
@@ -419,6 +754,52 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data == "server":
+        """Показать выбор сервера/локации"""
+        # Получить текущий сервер пользователя
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT server FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        current_server = row[0] if row and row[0] else DEFAULT_SERVER
+        conn.close()
+        
+        # Формируем сообщение
+        current_server_name = VPN_SERVERS.get(current_server, {}).get("name", "Неизвестно")
+        
+        message = f"🌍Выберите сервер для подключения:\n\nТекущая локация: {current_server_name}\n\nДоступные локации:"
+        
+        # Создаём кнопки для каждого сервера
+        keyboard = []
+        for server_id, server_info in VPN_SERVERS.items():
+            if server_id == current_server:
+                keyboard.append([InlineKeyboardButton(f"✅ {server_info['name']}", callback_data=f"set_server_{server_id}")])
+            else:
+                keyboard.append([InlineKeyboardButton(f"🌐 {server_info['name']}", callback_data=f"set_server_{server_id}")])
+        
+        keyboard.append([InlineKeyboardButton("Вернуться в главное меню", callback_data="back")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data.startswith("set_server_"):
+        """Установить выбранный сервер"""
+        new_server = data.replace("set_server_", "")
+        
+        if new_server not in VPN_SERVERS:
+            await query.edit_message_text("Ошибка: сервер не найден.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
+            return
+        
+        # Обновляем сервер пользователя
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET server = ? WHERE user_id = ?", (new_server, user_id))
+        conn.commit()
+        conn.close()
+        
+        server_name = VPN_SERVERS.get(new_server, {}).get("name", "Неизвестно")
+        message = f"✅Сервер изменён!\n\nВаша новая локация: {server_name}\n\nПри следующем получении ключа будет использоваться этот сервер."
+        keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "about":
         conn = sqlite3.connect('vpn_bot.db')
         cursor = conn.cursor()
@@ -469,6 +850,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             [InlineKeyboardButton("Пробный период⌚️", callback_data="trial")],
             [InlineKeyboardButton("Ваши ключи🔑", callback_data="my_keys")],
             [InlineKeyboardButton("Купить VPN💎", callback_data="buy_vpn")],
+            [InlineKeyboardButton("Сервер🌍", callback_data="server")],
             [InlineKeyboardButton("О сервисе📊", callback_data="about")],
             [InlineKeyboardButton("Помощь🆘", callback_data="help")]
         ]
@@ -633,15 +1015,122 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "buy_1m":
         message = (
             "🔢Еще несколько шагов и вы получите стабильный VPN🗿 с быстрейшей скоростью🏎\n"
-            "1️⃣Нажмите на кнопку \"Оплатить\" и внесите 129 руб. удобным вам способом и удобной вам валютой.\n"
-            "2️⃣Нажмите \"Проверить оплату\" и получите ключ.Наслаждайтесь быстрой скоростью🔰"
+            "1️⃣Нажмите на кнопку 'Оплатить' и внесите 129 руб. удобным вам способом и удобной вам валютой.\n"
+            "2️⃣Нажмите 'Проверить оплату' и получите ключ.Наслаждайтесь быстрой скоростью🔰"
         )
         keyboard = [
             [InlineKeyboardButton("Crypto Pay 🤖", callback_data="pay_1m")],
+            [InlineKeyboardButton("Telegram Stars ⭐️", callback_data="pay_stars_1m")],
             [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data.startswith("pay_stars_"):
+        # Обработка оплаты через Telegram Stars
+        months = int(data.replace("pay_stars_", "").replace("m", ""))
+        stars_amount = TELEGRAM_STARS_PRICES.get(months, 0)
+        
+        if stars_amount == 0:
+            await query.edit_message_text("Ошибка: тариф не найден.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
+            return
+        
+        message = f"🔢Оплата через Telegram Stars⭐️\n\nСтоимость: {stars_amount} Stars ({months} мес.)\n\nНажмите кнопку ниже для оплаты:"
+        keyboard = [
+            [InlineKeyboardButton(f"Оплатить {stars_amount} ⭐️", callback_data=f"init_stars_{months}m")],
+            [InlineKeyboardButton("Вернуться к тарифам", callback_data="buy_vpn")],
+            [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data.startswith("init_stars_"):
+        months = int(data.replace("init_stars_", "").replace("m", ""))
+        stars_amount = TELEGRAM_STARS_PRICES.get(months, 0)
+        
+        if stars_amount == 0:
+            await query.edit_message_text("Ошибка: тариф не найден.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
+            return
+        
+        # Проверить активную подписку
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT subscription_expiry FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        current_time = time.time()
+        if row and row[0] > current_time:
+            await query.edit_message_text("У вас уже есть активная подписка. Дождитесь окончания или обратитесь в поддержку.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
+            return
+        
+        # Генерируем уникальный payload для invoice
+        payload = f"stars_{user_id}_{months}_{int(time.time())}"
+        
+        # Создаём invoice через sendInvoice с валютой XTR (Telegram Stars)
+        try:
+            await context.bot.send_invoice(
+                chat_id=user_id,
+                title=f"VPN подписка на {months} месяцев",
+                description=f"Подписка на VPN сервис на {months} месяцев",
+                payload=payload,
+                currency="XTR",  # Telegram Stars
+                prices=[LabeledPrice(label=f"{months} мес.", amount=stars_amount)]
+            )
+            await query.edit_message_text("✅ Счёт отправлен! Проверьте личные сообщения от бота для оплаты.", 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
+        except Exception as e:
+            logger.error(f"Error sending Stars invoice: {e}")
+            await query.edit_message_text(f"Ошибка создания счёта: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]))
+    elif data.startswith("check_stars_"):
+        months = int(data.replace("check_stars_", "").replace("m", ""))
+        stars_amount = TELEGRAM_STARS_PRICES.get(months, 0)
+        
+        # Проверить платёж в БД
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT payment_id, status FROM payments WHERE user_id = ? AND currency = 'STARS' AND months = ? ORDER BY created_at DESC LIMIT 1", (user_id, months))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row and row[1] == 'paid':
+            # Платёж уже подтверждён
+            conn = sqlite3.connect('vpn_bot.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT trial_key FROM users WHERE user_id = ?", (user_id,))
+            key_row = cursor.fetchone()
+            conn.close()
+            
+            if key_row and key_row[0]:
+                message = f"✅Оплата подтверждена!\n\n🔑Ваш ключ:\n<code>{key_row[0]}</code>"
+            else:
+                # Создать ключ
+                loop = asyncio.get_event_loop()
+                key = await loop.run_in_executor(None, create_trial_client, user_id, months)
+                if key.startswith("vless://"):
+                    conn = sqlite3.connect('vpn_bot.db')
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE users SET trial_key = ? WHERE user_id = ?", (key, user_id))
+                    conn.commit()
+                    conn.close()
+                    message = f"✅Оплата подтверждена!\n\n🔑Ваш ключ:\n<code>{key}</code>"
+                else:
+                    message = f"✅Оплата подтверждена!\n\nОшибка генерации ключа: {key}"
+            
+            keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='HTML')
+        else:
+            # Платёж не найден или не подтверждён
+            message = (
+                f"⏳Оплата еще не подтверждена.\n\n"
+                f"Пожалуйста, завершите оплату {stars_amount} Stars⭐️\n\n"
+                f"После оплаты нажмите кнопку ниже для проверки."
+            )
+            keyboard = [
+                [InlineKeyboardButton("Проверить оплату🔍", callback_data=data)],
+                [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(message, reply_markup=reply_markup)
     elif data == "pay_1m":
         # Проверить активную подписку
         conn = sqlite3.connect('vpn_bot.db')
@@ -867,32 +1356,228 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             conn.close()
             await query.edit_message_text("Нет ожидающих платежей.")
     elif data == "my_keys":
+        """Показать все ключи пользователя"""
         conn = sqlite3.connect('vpn_bot.db')
         cursor = conn.cursor()
-        cursor.execute("SELECT subscription_expiry, trial_key FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
+        cursor.execute("SELECT subscription_expiry FROM users WHERE user_id = ?", (user_id,))
+        user_row = cursor.fetchone()
+        cursor.execute("SELECT id, key_name, key_uri, expiry_time FROM keys WHERE user_id = ? AND is_active = 1", (user_id,))
+        keys = cursor.fetchall()
         conn.close()
+        
         current_time = time.time()
-        subscription_active = row and row[0] > current_time
-        key = row[1] if row else None
-        if subscription_active and key:
-            date_str = time.strftime('%d.%m.%Y %H:%M', time.localtime(row[0]))
-            message = f"Ваша подписка активна до {date_str}.\n🔑Ключ:\n<code>{key}</code>"
-            keyboard = [
-                [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
-            ]
-        elif subscription_active:
-            date_str = time.strftime('%d.%m.%Y %H:%M', time.localtime(row[0]))
-            message = f"Ваша подписка активна до {date_str}, но ключ не найден."
-            keyboard = [[InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]]
-        else:
-            message = "У вас нет активной подписки."
+        subscription_active = user_row and user_row[0] > current_time
+        
+        if not subscription_active:
+            message = "🔑Мои ключи\n\nУ вас нет активной подписки. Приобретите подписку для создания ключей."
             keyboard = [
                 [InlineKeyboardButton("Купить VPN💎", callback_data="buy_vpn")],
                 [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
             ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(message, reply_markup=reply_markup)
+            return
+        
+        if not keys:
+            expiry_date = time.strftime('%d.%m.%Y', time.localtime(user_row[0]))
+            message = f"🔑Мои ключи\n\nУ вас нет созданных ключей.\nПодписка активна до: {expiry_date}"
+            keyboard = [
+                [InlineKeyboardButton("➕Создать новый ключ", callback_data="create_new_key")],
+                [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(message, reply_markup=reply_markup)
+        else:
+            # Показать список ключей
+            expiry_date = time.strftime('%d.%m.%Y', time.localtime(user_row[0]))
+            message = f"🔑Мои ключи ({len(keys)})\n\nПодписка активна до: {expiry_date}\n\nВыберите ключ:"
+            
+            keyboard = []
+            for key_id, key_name, key_uri, expiry_time in keys:
+                days_left = (expiry_time - current_time) / (24 * 3600)
+                status_emoji = "🟢" if days_left > 7 else ("🟡" if days_left > 1 else "🔴")
+                keyboard.append([
+                    InlineKeyboardButton(f"{status_emoji} {key_name}", callback_data=f"view_key_{key_id}")
+                ])
+            
+            keyboard.append([InlineKeyboardButton("➕Создать новый ключ", callback_data="create_new_key")])
+            keyboard.append([InlineKeyboardButton("Вернуться в главное меню", callback_data="back")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(message, reply_markup=reply_markup)
+    
+    elif data == "create_new_key":
+        """Создать новый ключ"""
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT subscription_expiry FROM users WHERE user_id = ?", (user_id,))
+        user_row = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*) FROM keys WHERE user_id = ? AND is_active = 1", (user_id,))
+        keys_count = cursor.fetchone()[0]
+        conn.close()
+        
+        current_time = time.time()
+        if not user_row or user_row[0] < current_time:
+            message = "❌У вас нет активной подписки."
+            keyboard = [
+                [InlineKeyboardButton("Купить VPN💎", callback_data="buy_vpn")],
+                [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(message, reply_markup=reply_markup)
+            return
+        
+        # Список предустановленных имен
+        key_names = ["Телефон", "Ноутбук", "ПК", "Планшет", "Роутер", "ТВ", "Другой"]
+        
+        message = f"➕Создать новый ключ\n\nУ вас уже создано ключей: {keys_count}\n\nВыберите название для нового ключа:"
+        
+        keyboard = []
+        for i, name in enumerate(key_names):
+            keyboard.append([InlineKeyboardButton(name, callback_data=f"set_key_name_{i}")])
+        
+        keyboard.append([InlineKeyboardButton("Назад к ключам", callback_data="my_keys")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='HTML')
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    
+    elif data.startswith("set_key_name_"):
+        """Установить имя ключа и создать его"""
+        name_index = int(data.replace("set_key_name_", ""))
+        key_names = ["Телефон", "Ноутбук", "ПК", "Планшет", "Роутер", "ТВ", "Другой"]
+        key_name = key_names[name_index] if name_index < len(key_names) else f"Ключ {name_index + 1}"
+        
+        # Создать ключ
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT subscription_expiry FROM users WHERE user_id = ?", (user_id,))
+        user_row = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*) FROM keys WHERE user_id = ? AND is_active = 1", (user_id,))
+        keys_count = cursor.fetchone()[0]
+        conn.close()
+        
+        if not user_row:
+            await query.edit_message_text("Ошибка: подписка не найдена.")
+            return
+        
+        months_left = (user_row[0] - time.time()) / (30 * 24 * 3600)
+        months = max(1, int(months_left))
+        
+        # Создаём ключ
+        uri, client_id = create_vpn_key(user_id, months, key_name)
+        
+        if uri:
+            # Сохраняем в БД
+            conn = sqlite3.connect('vpn_bot.db')
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO keys (user_id, key_name, key_uri, client_id, created_at, expiry_time) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, key_name, uri, client_id, int(time.time()), user_row[0])
+            )
+            conn.commit()
+            conn.close()
+            
+            message = f"✅Ключ '{key_name}' создан!\n\n🔑Ваш ключ:\n<code>{uri}</code>\n\n⚠️Нажмите на ключ чтобы скопировать его."
+            keyboard = [
+                [InlineKeyboardButton("📋Скопировать ключ", callback_data=f"copy_my_key_{uri[:50]}")],
+                [InlineKeyboardButton("🔙К ключам", callback_data="my_keys")],
+                [InlineKeyboardButton("🏠В главное меню", callback_data="back")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='HTML')
+        else:
+            await query.edit_message_text(f"❌Ошибка создания ключа: {client_id}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="create_new_key")]]))
+    
+    elif data.startswith("view_key_"):
+        """Просмотр конкретного ключа"""
+        key_id = int(data.replace("view_key_", ""))
+        
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT key_name, key_uri, expiry_time, client_id FROM keys WHERE id = ? AND user_id = ?", (key_id, user_id))
+        key_row = cursor.fetchone()
+        conn.close()
+        
+        if not key_row:
+            await query.edit_message_text("Ключ не найден.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="my_keys")]]))
+            return
+        
+        key_name, key_uri, expiry_time, client_id = key_row
+        current_time = time.time()
+        days_left = (expiry_time - current_time) / (24 * 3600)
+        
+        # Получаем статистику из x-ui
+        stats = get_key_statistics(client_id)
+        
+        if stats:
+            up_gb = stats['up'] / (1024 * 1024 * 1024)
+            down_gb = stats['down'] / (1024 * 1024 * 1024)
+            total_gb = up_gb + down_gb
+            stats_text = f"\n📊Статистика:\n⬆️Отдано: {up_gb:.2f} ГБ\n⬇️Получено: {down_gb:.2f} ГБ\n📦Всего: {total_gb:.2f} ГБ"
+        else:
+            stats_text = "\n📊Статистика недоступна"
+        
+        status_text = "🟢 Активен" if days_left > 7 else ("🟡 Истекает скоро" if days_left > 1 else "🔴 Истекает сегодня")
+        expiry_text = time.strftime('%d.%m.%Y %H:%M', time.localtime(expiry_time))
+        
+        message = f"🔑{key_name}\n\n{status_text}\n\n⏰Истекает: {expiry_text}\nОсталось: {int(days_left)} дней{stats_text}"
+        
+        keyboard = [
+            [InlineKeyboardButton("📋Скопировать ключ", callback_data=f"copy_my_key_{key_id}")],
+            [InlineKeyboardButton("🗑Удалить ключ", callback_data=f"delete_key_{key_id}")],
+            [InlineKeyboardButton("🔙К списку ключей", callback_data="my_keys")],
+            [InlineKeyboardButton("🏠В главное меню", callback_data="back")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    
+    elif data.startswith("copy_my_key_"):
+        """Копировать ключ"""
+        key_id_str = data.replace("copy_my_key_", "")
+        
+        # Пробуем найти по URI или по ID
+        try:
+            key_id = int(key_id_str)
+            conn = sqlite3.connect('vpn_bot.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT key_uri, key_name FROM keys WHERE id = ? AND user_id = ?", (key_id, user_id))
+            key_row = cursor.fetchone()
+            conn.close()
+            
+            if key_row:
+                key_uri, key_name = key_row
+                await query.answer()
+                await update.callback_query.message.reply_text(f"🔑Ключ '{key_name}':\n\n<code>{key_uri}</code>", parse_mode='HTML')
+            else:
+                await query.answer("Ключ не найден.")
+        except ValueError:
+            # Это был URI
+            await query.answer()
+            await update.callback_query.message.reply_text(f"🔑Ключ:\n\n<code>{key_id_str}</code>", parse_mode='HTML')
+    
+    elif data.startswith("delete_key_"):
+        """Удалить ключ"""
+        key_id = int(data.replace("delete_key_", ""))
+        
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT key_name FROM keys WHERE id = ? AND user_id = ?", (key_id, user_id))
+        key_row = cursor.fetchone()
+        
+        if key_row:
+            key_name = key_row[0]
+            cursor.execute("UPDATE keys SET is_active = 0 WHERE id = ?", (key_id,))
+            conn.commit()
+            conn.close()
+            
+            message = f"✅Ключ '{key_name}' удалён."
+            keyboard = [
+                [InlineKeyboardButton("🔙К списку ключей", callback_data="my_keys")],
+                [InlineKeyboardButton("🏠В главное меню", callback_data="back")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(message, reply_markup=reply_markup)
+        else:
+            conn.close()
+            await query.edit_message_text("Ключ не найден.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="my_keys")]]))
     elif data == "cancel_payment":
         conn = sqlite3.connect('vpn_bot.db')
         cursor = conn.cursor()
@@ -918,6 +1603,110 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.callback_query.message.reply_text(f"```{escaped_key}```", parse_mode='MarkdownV2')
         else:
             await query.answer("Ключ не найден.")
+    elif data == "renew_subscription":
+        # Показать тарифы для продления
+        message = (
+            "🔄Продление подписки\n\n"
+            "Выберите тариф для продления подписки со скидкой 10%!\n"
+            "Скидка действует только при продлении."
+        )
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT months, price FROM tariffs ORDER BY months")
+        rows = cursor.fetchall()
+        conn.close()
+        keyboard = []
+        for months, price in rows:
+            discounted_price = int(price * 0.9)  # 10% скидка
+            keyboard.append([InlineKeyboardButton(f"{months} мес. - {discounted_price} руб. (скидка 10%)", callback_data=f"renew_{months}m")])
+        keyboard.append([InlineKeyboardButton("Вернуться в главное меню", callback_data="back")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data.startswith("renew_"):
+        # Обработка выбора тарифа для продления
+        months = int(data.replace("renew_", "").replace("m", ""))
+        
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT price FROM tariffs WHERE months = ?", (months,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            original_price = int(row[0])
+            discounted_price = int(original_price * 0.9)  # 10% скидка
+            
+            message = (
+                f"🔄Продление на {months} месяцев\n\n"
+                f"Старая цена: {original_price} руб.\n"
+                f"💎Цена со скидкой: {discounted_price} руб.\n\n"
+                "Выберите способ оплаты:"
+            )
+            keyboard = [
+                [InlineKeyboardButton("Crypto Pay 🤖", callback_data=f"renew_pay_{months}m")],
+                [InlineKeyboardButton("Telegram Stars ⭐️", callback_data=f"renew_stars_{months}m")],
+                [InlineKeyboardButton("Вернуться", callback_data="renew_subscription")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(message, reply_markup=reply_markup)
+    elif data.startswith("renew_pay_"):
+        months = int(data.replace("renew_pay_", "").replace("m", ""))
+        
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT price FROM tariffs WHERE months = ?", (months,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            original_price = int(row[0])
+            discounted_price = int(original_price * 0.9)
+            
+            payment_id, payment_url = create_crypto_pay_invoice(discounted_price, description=f'VPN renewal {months} months')
+            if payment_id:
+                conn = sqlite3.connect('vpn_bot.db')
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO payments (user_id, amount, currency, status, payment_id, created_at, months) VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, discounted_price, 'RUB', 'pending', payment_id, int(time.time()), months))
+                conn.commit()
+                conn.close()
+                message = f"Ссылка на оплату (со скидкой {discounted_price} руб.)⬇️"
+                keyboard = [
+                    [InlineKeyboardButton(f"Оплатить | {discounted_price} руб.💸", url=payment_url)],
+                    [InlineKeyboardButton("Проверить оплату📩", callback_data="check_payment")],
+                    [InlineKeyboardButton("Отменить❌", callback_data="renew_subscription")],
+                    [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(message, reply_markup=reply_markup)
+            else:
+                await query.edit_message_text("Ошибка создания платежа.")
+    elif data.startswith("renew_stars_"):
+        months = int(data.replace("renew_stars_", "").replace("m", ""))
+        stars_amount = TELEGRAM_STARS_PRICES.get(months, 0)
+        
+        if stars_amount == 0:
+            await query.edit_message_text("Ошибка: тариф не найден.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться", callback_data="renew_subscription")]]))
+            return
+        
+        # Создаём invoice со скидкой 10%
+        discounted_stars = int(stars_amount * 0.9)
+        
+        payload = f"renew_{user_id}_{months}_{int(time.time())}"
+        
+        try:
+            await context.bot.send_invoice(
+                chat_id=user_id,
+                title=f"VPN продление на {months} мес.",
+                description=f"Продление подписки на {months} месяцев со скидкой 10%",
+                payload=payload,
+                currency="XTR",
+                prices=[LabeledPrice(label=f"{months} мес.", amount=discounted_stars)]
+            )
+            await query.edit_message_text("✅ Счёт отправлен! Проверьте личные сообщения для оплаты.", 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться", callback_data="back")]]))
+        except Exception as e:
+            logger.error(f"Error sending Stars invoice: {e}")
+            await query.edit_message_text(f"Ошибка создания счёта: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться", callback_data="renew_subscription")]]))
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.from_user.id not in ADMINS:
@@ -1161,6 +1950,94 @@ async def setabout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     log_action("set_about", 0, "About message updated")
     await update.message.reply_text("Сообщение о сервисе обновлено.")
 
+async def check_subscription_expiry(application):
+    """Проверяет истекающие подписки и отправляет уведомления."""
+    while True:
+        current_time = time.time()
+        conn = sqlite3.connect('vpn_bot.db')
+        cursor = conn.cursor()
+        
+        # Проверяем пользователей с активной подпиской
+        cursor.execute("SELECT user_id, subscription_expiry, days_7_notified, days_3_notified, days_1_notified FROM users WHERE subscription_expiry > ?", (current_time,))
+        users = cursor.fetchall()
+        
+        for user_id, expiry, days_7, days_3, days_1 in users:
+            days_left = (expiry - current_time) / (24 * 3600)
+            
+            try:
+                # Уведомление за 7 дней
+                if days_left <= 7 and days_left > 3 and not days_7:
+                    keyboard = [
+                        [InlineKeyboardButton("Продлить подписку 🔄", callback_data="renew_subscription")],
+                        [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await application.bot.send_message(
+                        chat_id=user_id, 
+                        text=f"⏰ Ваша подписка истекает через 7 дней!\n\nНе забудьте продлить подписку, чтобы продолжить пользоваться VPN без перерыва.",
+                        reply_markup=reply_markup
+                    )
+                    cursor.execute("UPDATE users SET days_7_notified = 1 WHERE user_id = ?", (user_id,))
+                    logger.info(f"7-day notification sent to user {user_id}")
+                
+                # Уведомление за 3 дня
+                elif days_left <= 3 and days_left > 1 and not days_3:
+                    keyboard = [
+                        [InlineKeyboardButton("Продлить подписку 🔄", callback_data="renew_subscription")],
+                        [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await application.bot.send_message(
+                        chat_id=user_id, 
+                        text=f"⚠️ Ваша подписка истекает через 3 дня!\n\nСпешите продлить подписку со скидкой 10%!",
+                        reply_markup=reply_markup
+                    )
+                    cursor.execute("UPDATE users SET days_3_notified = 1 WHERE user_id = ?", (user_id,))
+                    logger.info(f"3-day notification sent to user {user_id}")
+                
+                # Уведомление за 1 день
+                elif days_left <= 1 and days_left > 0 and not days_1:
+                    keyboard = [
+                        [InlineKeyboardButton("Продлить подписку 🔄", callback_data="renew_subscription")],
+                        [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await application.bot.send_message(
+                        chat_id=user_id, 
+                        text=f"🚨 Ваша подписка истекает ЗАВТРА!\n\nПослезавтра VPN перестанет работать. Продлите подписку прямо сейчас!",
+                        reply_markup=reply_markup
+                    )
+                    cursor.execute("UPDATE users SET days_1_notified = 1 WHERE user_id = ?", (user_id,))
+                    logger.info(f"1-day notification sent to user {user_id}")
+                    
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+        
+        # Проверяем истекшие подписки для финального уведомления
+        cursor.execute("SELECT user_id FROM users WHERE subscription_expiry > 0 AND subscription_expiry < ? AND expired_notified = 0", (current_time,))
+        expired_users = cursor.fetchall()
+        for (user_id,) in expired_users:
+            try:
+                keyboard = [
+                    [InlineKeyboardButton("Купить подписку 💎", callback_data="buy_vpn")],
+                    [InlineKeyboardButton("Вернуться в главное меню", callback_data="back")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await application.bot.send_message(
+                    chat_id=user_id, 
+                    text="❌ Ваша подписка истекла!\n\nДля продолжения использования VPN приобретите новую подписку.",
+                    reply_markup=reply_markup
+                )
+                cursor.execute("UPDATE users SET expired_notified = 1 WHERE user_id = ?", (user_id,))
+                logger.info(f"Expiry notification sent to user {user_id}")
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+        
+        conn.commit()
+        conn.close()
+        await asyncio.sleep(1800)  # Проверка каждые 30 минут
+
+
 async def check_trial_expiry(application):
     """Проверяет истекшие пробные периоды и отправляет уведомления."""
     while True:
@@ -1265,6 +2142,38 @@ async def main() -> None:
         cursor.execute("ALTER TABLE payments ADD COLUMN months INTEGER")
     except sqlite3.OperationalError:
         pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN server TEXT DEFAULT 'germany'")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN days_7_notified INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN days_3_notified INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN days_1_notified INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN expired_notified INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+    # Создать таблицу для мульти-ключей
+    cursor.execute('''CREATE TABLE IF NOT EXISTS keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        key_name TEXT,
+        key_uri TEXT,
+        client_id TEXT,
+        created_at INTEGER,
+        expiry_time INTEGER,
+        is_active INTEGER DEFAULT 1
+    )''')
 
     conn.commit()
     conn.close()
@@ -1279,6 +2188,10 @@ async def main() -> None:
 
     # Добавление обработчика callback запросов
     application.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Добавление обработчиков Telegram Stars платежей
+    application.add_handler(PreCheckoutQueryHandler(pre_checkout_query))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
     # Добавление админ команд
     application.add_handler(CommandHandler("ban", ban_command))
@@ -1297,6 +2210,9 @@ async def main() -> None:
 
     # Запустить фоновую задачу для проверки истекших пробных периодов
     asyncio.create_task(check_trial_expiry(application))
+    
+    # Запустить фоновую задачу для проверки истекающих подписок
+    asyncio.create_task(check_subscription_expiry(application))
 
     # Запуск бота
     await application.run_polling()
